@@ -1,0 +1,25 @@
+<Project ToolsVersion="15.0" DefaultTargets="Build">
+  <PropertyGroup>
+    <PcfMsBuildVersion>1.51.1</PcfMsBuildVersion>
+    <NuGetPackageRoot Condition="'$(NuGetPackageRoot)' == ''">$(UserProfile)\.nuget\packages\</NuGetPackageRoot>
+    <PcfMsBuildPackagePath>$(NuGetPackageRoot)microsoft.powerapps.msbuild.pcf\$(PcfMsBuildVersion)\build\Microsoft.PowerApps.MSBuild.Pcf</PcfMsBuildPackagePath>
+  </PropertyGroup>
+
+  <Import Project="$(PcfMsBuildPackagePath).props" />
+
+  <PropertyGroup>
+    <Name>TaskGantt</Name>
+    <ProjectGuid>{8FCF10C0-795D-4765-A107-ECCDC8E8206C}</ProjectGuid>
+    <BaseOutputPath>bin\</BaseOutputPath>
+    <BaseIntermediateOutputPath>obj\</BaseIntermediateOutputPath>
+    <OutputPath>$(MSBuildThisFileDirectory)out\controls</OutputPath>
+    <PcfBuildMode>development</PcfBuildMode>
+  </PropertyGroup>
+
+  <Target Name="BeforeBuild" />
+  <Target Name="CoreBuild" />
+  <Target Name="AfterBuild" />
+  <Target Name="Build" DependsOnTargets="BeforeBuild;CoreBuild;AfterBuild" />
+
+  <Import Project="$(PcfMsBuildPackagePath).targets" />
+</Project>
