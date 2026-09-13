@@ -1,6 +1,9 @@
 <?xml version="1.0" encoding="utf-8" ?>
 <manifest>
-  <control namespace="Voss" constructor="TaskGantt" version="3.0.0" display-name-key="Task Gantt" description-key="Responsive Gantt view for Dataverse tasks" control-type="virtual">
+  <control namespace="Voss" constructor="TaskGantt" version="3.2.0" display-name-key="Task Gantt" description-key="Responsive Gantt view for Dataverse tasks" control-type="virtual">
+    <external-service-usage enabled="true">
+      <domain>modern365timeline-license-fkh6gbgdhnchgyhj.westeurope-01.azurewebsites.net</domain>
+    </external-service-usage>
     <data-set name="tasks" display-name-key="Tasks" cds-data-set-options="displayCommandBar:false;displayViewSelector:false;displayQuickFind:false">
       <property-set name="subject" display-name-key="Task name" description-key="Task subject" of-type="SingleLine.Text" usage="bound" required="true" />
       <property-set name="scheduledend" display-name-key="Due Date" description-key="Scheduled end" of-type="DateAndTime.DateAndTime" usage="bound" required="true" />
@@ -9,12 +12,16 @@
       <property-set name="scheduledstart" display-name-key="Start Date" description-key="Scheduled start" of-type="DateAndTime.DateAndTime" usage="bound" required="true" />
       <property-set name="createdon" display-name-key="Created On" description-key="Created on" of-type="DateAndTime.DateAndTime" usage="bound" required="true" />
     </data-set>
+    <property name="licenseKey" display-name-key="License Key" description-key="License key used to activate the control" of-type="SingleLine.Text" usage="input" required="false" />
     <resources>
       <code path="index.ts" order="1" />
       <platform-library name="React" version="16.14.0" />
       <css path="css/TaskGantt.css" order="1" />
       <resx path="strings/TaskGantt.1033.resx" version="1.0.0" />
     </resources>
-    <feature-usage><uses-feature name="Utility" required="true" /></feature-usage>
+    <feature-usage>
+      <uses-feature name="Utility" required="true" />
+      <uses-feature name="WebAPI" required="true" />
+    </feature-usage>
   </control>
 </manifest>
