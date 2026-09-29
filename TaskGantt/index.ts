@@ -1,6 +1,6 @@
 import { IInputs, IOutputs } from "./generated/ManifestTypes";
 import * as React from "react";
-import { DateFilter, Gantt, LicenseDebugInfo, LicenseState, SortState, StatusFilter, TaskItem } from "./src/Gantt";
+import { cleanupTaskGanttOverlays, DateFilter, Gantt, LicenseDebugInfo, LicenseState, SortState, sortTasksForDisplay, StatusFilter, TaskItem } from "./src/Gantt";
 
 type Column = ComponentFramework.PropertyHelper.DataSetApi.Column;
 type ConditionExpression = ComponentFramework.PropertyHelper.DataSetApi.ConditionExpression;
@@ -41,6 +41,9 @@ export class TaskGantt implements ComponentFramework.ReactControl<IInputs, IOutp
   private sorting: SortState;
   private lastAppliedFilterSignature = "status:all:|createdOn:all|dueDate:all";
   private lastAppliedSortingSignature = "";
+  private manualRefreshInFlight = false;
+  private manualRefreshSawLoading = false;
+  private instanceId = `taskgantt-${Math.random().toString(36).slice(2)}`;
   private completedRawValue: string | undefined;
   private observedActiveRawValue: string | undefined;
   private lastStatusResolutionLogSignature = "";
@@ -56,7 +59,7 @@ export class TaskGantt implements ComponentFramework.ReactControl<IInputs, IOutp
   private dataverseCacheCheckedForKey = "";
   private dataverseCacheCheckInFlight = false;
 
-  private static readonly BUILD_VERSION = "3.2.0";
+  private static readonly BUILD_VERSION = "3.2.1";
   private static readonly CONTROL_CODE = "moderngantt";
   private static readonly LICENSE_ENDPOINT = "https://modern365timeline-license-fkh6gbgdhnchgyhj.westeurope-01.azurewebsites.net/api/validateLicense";
 
@@ -79,6 +82,15 @@ export class TaskGantt implements ComponentFramework.ReactControl<IInputs, IOutp
       this.pageSizeConfigured = true;
     }
 
+    if (this.manualRefreshInFlight) {
+      if (ds.loading) {
+        this.manualRefreshSawLoading = true;
+      } else if (this.manualRefreshSawLoading) {
+        this.manualRefreshInFlight = false;
+        this.manualRefreshSawLoading = false;
+      }
+    }
+
     const scheduledStartColumn = this.resolveColumn(ds.columns, "scheduledstart");
     const createdOnColumn = this.resolveColumn(ds.columns, "createdon");
     const scheduledEndColumn = this.resolveColumn(ds.columns, "scheduledend");
@@ -89,7 +101,7 @@ export class TaskGantt implements ComponentFramework.ReactControl<IInputs, IOutp
       this.observeStatusValues(ds, stateColumn);
     }
 
-    const tasks: TaskItem[] = ds.sortedRecordIds.map((id: string) => {
+    const mappedTasks: TaskItem[] = ds.sortedRecordIds.map((id: string) => {
       const r = ds.records[id];
       const value = (column?: Column) => column ? r.getValue(column.name) as string | Date | null : null;
       const formatted = (column?: Column) => column ? r.getFormattedValue(column.name) : "";
@@ -107,6 +119,8 @@ export class TaskGantt implements ComponentFramework.ReactControl<IInputs, IOutp
         due: new Date(value(scheduledEndColumn) as string | Date)
       };
     });
+    const tasks: TaskItem[] = sortTasksForDisplay(mappedTasks, this.sorting);
+    this.logSortDiagnostics(mappedTasks, tasks);
 
     const allocatedWidth = Number(context.mode.allocatedWidth) || 0;
     const allocatedHeight = Number(context.mode.allocatedHeight) || 0;
@@ -124,8 +138,12 @@ export class TaskGantt implements ComponentFramework.ReactControl<IInputs, IOutp
       onRevalidateLicense: () => this.revalidateLicense(),
       onFiltersChange: (filters: FilterState) => this.applyFilters(ds, filters),
       onSortChange: (sorting: SortState) => this.applySorting(ds, sorting),
+      onRefresh: () => this.refreshDataset(ds),
       onOpen: (recordId: string) => ds.openDatasetItem(ds.records[recordId].getNamedReference()),
-      onLoadMore: ds.paging.hasNextPage && !ds.loading ? () => ds.paging.loadNextPage() : undefined
+      onLoadMore: ds.paging.hasNextPage && !ds.loading ? () => ds.paging.loadNextPage() : undefined,
+      refreshDisabled: ds.loading || this.manualRefreshInFlight,
+      refreshing: ds.loading || this.manualRefreshInFlight,
+      instanceId: this.instanceId
     });
   }
 
@@ -476,7 +494,6 @@ export class TaskGantt implements ComponentFramework.ReactControl<IInputs, IOutp
     const columns: Record<NonNullable<SortState>["key"], Column | undefined> = {
       task: this.resolveColumn(ds.columns, "subject"),
       assignedTo: this.resolveColumn(ds.columns, "ownerid"),
-      status: this.resolveColumn(ds.columns, "statecode"),
       startDate: this.resolveColumn(ds.columns, "scheduledstart"),
       dueDate: this.resolveColumn(ds.columns, "scheduledend")
     };
@@ -487,16 +504,58 @@ export class TaskGantt implements ComponentFramework.ReactControl<IInputs, IOutp
       return;
     }
 
-    const signature = sorting && column ? `${column.name}:${sorting.direction}` : "";
+    const columnName = sorting && column ? column.name : "";
+    const signature = sorting && column ? `${columnName}:${sorting.direction}` : "";
     if (signature === this.lastAppliedSortingSignature) return;
 
     this.sorting = sorting;
     this.lastAppliedSortingSignature = signature;
+    this.logSortRequest(sorting, columnName);
     ds.sorting = sorting && column ? [{
-      name: column.name,
+      name: columnName,
       sortDirection: sorting.direction === "asc" ? 0 : 1
     } as SortStatus] : [];
     ds.paging.reset();
+    ds.refresh();
+  }
+
+  private logSortRequest(sorting: SortState, resolvedColumnName: string): void {
+    if (!sorting || !shouldLogSortDiagnostics()) return;
+    console.info("TaskGantt sort requested", {
+      clickedColumn: sorting.key,
+      requestedDirection: sorting.direction,
+      resolvedColumnName
+    });
+  }
+
+  private logSortDiagnostics(before: TaskItem[], after: TaskItem[]): void {
+    if (!this.sorting || !shouldLogSortDiagnostics()) return;
+    console.info("TaskGantt sort diagnostics", {
+      sortColumn: this.sorting.key,
+      direction: this.sorting.direction,
+      before: before.map(task => this.getRedactedSortDiagnosticValue(task)),
+      after: after.map(task => this.getRedactedSortDiagnosticValue(task)),
+      rendererRecordIds: after.map(task => task.recordId)
+    });
+  }
+
+  private getRedactedSortDiagnosticValue(task: TaskItem): { recordId: string; value: string | number | null } {
+    if (!this.sorting) return { recordId: task.recordId, value: null };
+    if (this.sorting.key === "startDate" || this.sorting.key === "dueDate") {
+      const value = this.sorting.key === "startDate" ? task.start.getTime() : task.due.getTime();
+      return { recordId: task.recordId, value: Number.isNaN(value) ? null : value };
+    }
+
+    const text = this.sorting.key === "task" ? task.name : task.assignedTo;
+    const normalized = text.trim().toLocaleLowerCase();
+    return { recordId: task.recordId, value: normalized ? `hash:${hashString(normalized)}` : null };
+  }
+
+  private refreshDataset(ds: ComponentFramework.PropertyTypes.DataSet): void {
+    if (ds.loading || this.manualRefreshInFlight) return;
+    this.manualRefreshInFlight = true;
+    this.manualRefreshSawLoading = false;
+    this.requestControlRender();
     ds.refresh();
   }
 
@@ -592,6 +651,7 @@ export class TaskGantt implements ComponentFramework.ReactControl<IInputs, IOutp
   public destroy(): void {
     this.clearLicenseWatchdog();
     this.activeLicenseAbortController?.abort();
+    cleanupTaskGanttOverlays(this.instanceId);
   }
 }
 
@@ -690,6 +750,18 @@ function hashString(value: string): string {
   }
 
   return (hash >>> 0).toString(16);
+}
+
+function shouldLogSortDiagnostics(): boolean {
+  try {
+    return typeof process !== "undefined"
+      && process.env
+      && process.env.NODE_ENV !== "production"
+      && typeof window !== "undefined"
+      && window.localStorage?.getItem("TaskGanttSortDiagnostics") === "true";
+  } catch {
+    return false;
+  }
 }
 
 function maskLicenseKey(licenseKey: string): string {

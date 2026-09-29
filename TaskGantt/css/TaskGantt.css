@@ -150,23 +150,6 @@
   line-height: 1;
 }
 
-.tg-info em {
-  position: absolute;
-  top: calc(100% + 6px);
-  left: 0;
-  z-index: 20;
-  display: none;
-  max-width: min(260px, 70vw);
-  padding: 6px 8px;
-  border: 1px solid #c8c6c4;
-  border-radius: 6px;
-  background: #fff;
-  box-shadow: 0 4px 12px #0002;
-  color: #323130;
-  font: 12px "Segoe UI", sans-serif;
-  white-space: nowrap;
-}
-
 .tg-info:hover,
 .tg-info:focus-visible {
   background: #eff6fc;
@@ -174,9 +157,66 @@
   outline-offset: 2px;
 }
 
-.tg-info:hover em,
-.tg-info:focus-visible em {
+.tg-info-overlay {
+  position: fixed;
+  z-index: 2147483000;
+  max-width: min(280px, calc(100vw - 16px));
+  box-sizing: border-box;
+  padding: 7px 10px;
+  border: 1px solid #c8c6c4;
+  border-radius: 6px;
+  background: #fff;
+  box-shadow: 0 8px 20px #0003;
+  color: #323130;
+  font: 12px "Segoe UI", sans-serif;
+  white-space: nowrap;
+  pointer-events: auto;
+}
+
+.tg-refresh {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border: 1px solid #c8c6c4;
+  border-radius: 4px;
+  background: #fff;
+  color: #0f6cbd;
+  cursor: pointer;
+  padding: 0;
+}
+
+.tg-refresh svg {
   display: block;
+  width: 16px;
+  height: 16px;
+  fill: currentColor;
+}
+
+.tg-refresh:hover:not(:disabled) {
+  background: #eff6fc;
+}
+
+.tg-refresh:focus-visible {
+  outline: 2px solid #0f6cbd;
+  outline-offset: 2px;
+}
+
+.tg-refresh:disabled {
+  color: #a19f9d;
+  cursor: default;
+}
+
+.tg-refresh.is-refreshing svg {
+  animation: tg-spin 0.9s linear infinite;
+}
+
+@keyframes tg-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .tg-actions {
@@ -324,6 +364,18 @@
   font-style: normal;
   font-size: 13px;
   line-height: 1;
+}
+
+.tg-schedule-head {
+  align-items: stretch;
+  flex-direction: column;
+  justify-content: center;
+  gap: 2px;
+}
+
+.tg-schedule-head .tg-sort {
+  min-height: 22px;
+  font-size: 12px;
 }
 
 .tg-sticky {

@@ -2,7 +2,7 @@ import * as React from "react";
 
 export type StatusFilter = "all" | "active" | "completed" | "overdue";
 export type DateFilter = "all" | "thisWeek" | "lastWeek" | "thisMonth" | "lastMonth";
-export type SortKey = "task" | "assignedTo" | "status" | "startDate" | "dueDate";
+export type SortKey = "task" | "assignedTo" | "startDate" | "dueDate";
 export type SortDirection = "asc" | "desc";
 export type SortState = { key:SortKey; direction:SortDirection } | undefined;
 export type TaskItem = { recordId:string; name:string; assignedTo:string; status:"Active"|"Completed"; start:Date; due:Date };
@@ -30,7 +30,7 @@ export type LicenseDebugInfo = {
     durationMs?:number;
   };
 };
-export const CONTROL_VERSION = "3.2";
+export const CONTROL_VERSION = "3.2.1";
 
 export type TaskFilters = {
   status: StatusFilter;
@@ -51,8 +51,12 @@ type Props = {
   onRevalidateLicense:()=>void;
   onFiltersChange:(filters:TaskFilters)=>void;
   onSortChange:(sorting:SortState)=>void;
+  onRefresh:()=>void;
   onOpen:(id:string)=>void;
   onLoadMore?:()=>void;
+  refreshDisabled:boolean;
+  refreshing:boolean;
+  instanceId:string;
 };
 
 export type TaskUrgency = "completed" | "overdue" | "dueSoon" | "normal";
@@ -61,6 +65,49 @@ const clamp = (value:number,min:number,max:number) => Math.min(max,Math.max(min,
 const startOfDay = (d:Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate());
 const addDays = (d:Date,n:number) => new Date(d.getFullYear(),d.getMonth(),d.getDate()+n);
 const fmt = (d:Date) => d.toLocaleDateString(undefined,{day:"2-digit",month:"short",year:"numeric"});
+const bodyOverlayIds = new Set<string>();
+
+export function sortTasksForDisplay(tasks:TaskItem[], sorting:SortState):TaskItem[] {
+  if (!sorting) return tasks;
+  const direction = sorting.direction === "asc" ? 1 : -1;
+  return tasks
+    .map((task,index)=>({task,index,value:getSortValue(task,sorting.key)}))
+    .sort((a,b)=>{
+      const aNull = a.value === null;
+      const bNull = b.value === null;
+      if (aNull && bNull) return a.index - b.index;
+      if (aNull) return 1;
+      if (bNull) return -1;
+      const result = typeof a.value === "number" && typeof b.value === "number"
+        ? a.value - b.value
+        : String(a.value).localeCompare(String(b.value), undefined, {sensitivity:"base", numeric:true});
+      return result === 0 ? a.index - b.index : result * direction;
+    })
+    .map(item=>item.task);
+}
+
+function getSortValue(task:TaskItem,key:SortKey):string|number|null {
+  if (key === "task") return normalizeText(task.name);
+  if (key === "assignedTo") return normalizeText(task.assignedTo);
+  const date = key === "startDate" ? task.start : task.due;
+  const time = date.getTime();
+  return Number.isNaN(time) ? null : time;
+}
+
+function normalizeText(value:string):string|null {
+  const normalized = value.trim().toLocaleLowerCase();
+  return normalized ? normalized : null;
+}
+
+export function cleanupTaskGanttOverlays(instanceId?:string):void {
+  if (typeof document === "undefined") return;
+  const ids = instanceId ? [`tg-info-overlay-${instanceId}`] : Array.from(bodyOverlayIds);
+  ids.forEach(id=>{
+    document.getElementById(id)?.remove();
+    bodyOverlayIds.delete(id);
+  });
+}
+
 export const getTaskUrgency = (task:TaskItem, now:Date = new Date()):TaskUrgency => {
   if (task.status === "Completed") return "completed";
   if (isNaN(task.due.getTime())) return "normal";
@@ -84,11 +131,14 @@ const UrgencyIndicator: React.FC<{urgency:TaskUrgency;due:Date}> = ({urgency,due
   </span>;
 };
 
-export const Gantt: React.FC<Props> = ({tasks,allocatedHeight,allocatedWidth,loading,filters,sorting,licenseState,licenseMessage,onRevalidateLicense,onFiltersChange,onSortChange,onOpen,onLoadMore}) => {
+export const Gantt: React.FC<Props> = ({tasks,allocatedHeight,allocatedWidth,loading,filters,sorting,licenseState,licenseMessage,onRevalidateLicense,onFiltersChange,onSortChange,onRefresh,onOpen,onLoadMore,refreshDisabled,refreshing,instanceId}) => {
   const scrollRef = React.useRef<HTMLDivElement>(null);
   const todayRef = React.useRef<HTMLElement>(null);
+  const infoButtonRef = React.useRef<HTMLButtonElement>(null);
   const positionedSignatures = React.useRef<Record<string,string>>({});
   const lastTimelineSignature = React.useRef("");
+  const [infoOpen,setInfoOpen] = React.useState(false);
+  const overlayId = `tg-info-overlay-${instanceId}`;
 
   const changeFilters = (nextFilters:TaskFilters) => {
     scrollRef.current?.scrollTo({top:0,left:0,behavior:"auto"});
@@ -142,6 +192,72 @@ export const Gantt: React.FC<Props> = ({tasks,allocatedHeight,allocatedWidth,loa
   const layoutMode = compactMode ? "compact" : "detailed";
   const timelineSignature = `${layoutMode}|${timelineStart.getTime()}|${numberOfDays}|${dayWidth}`;
 
+  React.useEffect(() => {
+    if (!infoOpen || typeof document === "undefined") {
+      cleanupTaskGanttOverlays(instanceId);
+      return undefined;
+    }
+
+    const button = infoButtonRef.current;
+    if (!button) return undefined;
+
+    const overlay = document.createElement("div");
+    overlay.id = overlayId;
+    overlay.className = "tg-info-overlay";
+    overlay.setAttribute("role", "tooltip");
+    overlay.textContent = `Task Gantt PCF version ${CONTROL_VERSION}`;
+    document.body.appendChild(overlay);
+    bodyOverlayIds.add(overlayId);
+
+    let frame = 0;
+    const positionOverlay = () => {
+      window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(() => {
+        const rect = button.getBoundingClientRect();
+        const overlayRect = overlay.getBoundingClientRect();
+        const gap = 8;
+        const viewportPadding = 8;
+        const overlayWidth = overlayRect.width || 240;
+        const overlayHeight = overlayRect.height || 32;
+        const roomBelow = window.innerHeight - rect.bottom;
+        const top = roomBelow >= overlayHeight + gap + viewportPadding
+          ? rect.bottom + gap
+          : Math.max(viewportPadding, rect.top - overlayHeight - gap);
+        const preferredLeft = rect.left + (rect.width / 2) - (overlayWidth / 2);
+        const left = clamp(preferredLeft, viewportPadding, Math.max(viewportPadding, window.innerWidth - overlayWidth - viewportPadding));
+        overlay.style.top = `${top}px`;
+        overlay.style.left = `${left}px`;
+      });
+    };
+
+    const closeIfOutside = (event:PointerEvent) => {
+      const target = event.target as Node | null;
+      if (target && (button.contains(target) || overlay.contains(target))) return;
+      setInfoOpen(false);
+    };
+    const closeOnEscape = (event:KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setInfoOpen(false);
+        button.focus();
+      }
+    };
+
+    positionOverlay();
+    document.addEventListener("pointerdown", closeIfOutside, true);
+    document.addEventListener("keydown", closeOnEscape, true);
+    window.addEventListener("resize", positionOverlay);
+    document.addEventListener("scroll", positionOverlay, true);
+
+    return () => {
+      window.cancelAnimationFrame(frame);
+      document.removeEventListener("pointerdown", closeIfOutside, true);
+      document.removeEventListener("keydown", closeOnEscape, true);
+      window.removeEventListener("resize", positionOverlay);
+      document.removeEventListener("scroll", positionOverlay, true);
+      cleanupTaskGanttOverlays(instanceId);
+    };
+  }, [infoOpen, instanceId, overlayId]);
+
   React.useLayoutEffect(() => {
     if (loading || todayIndex < 0 || todayIndex >= numberOfDays) return;
     const scroll = scrollRef.current;
@@ -184,13 +300,17 @@ export const Gantt: React.FC<Props> = ({tasks,allocatedHeight,allocatedWidth,loa
   }, [filterSignature, loading, numberOfDays, timelineSignature, todayIndex]);
 
   const renderTimelineCells = () => dateCells.map((d,i)=><i key={i} className={d.getDay()%6===0?"weekend":""}/>);
+  const renderSortButton = (label:string,key:SortKey) => {
+    const active = sorting?.key === key;
+    return <button className="tg-sort" type="button" onClick={()=>changeSort(key)}>
+      <span>{label}</span>{active && <i aria-hidden="true">{sorting.direction === "asc" ? "\u25B2" : "\u25BC"}</i>}
+    </button>;
+  };
   const renderSortHeader = (label:string,key:SortKey,className:string) => {
     const active = sorting?.key === key;
     const ariaSort = active ? sorting.direction === "asc" ? "ascending" : "descending" : "none";
     return <div className={`tg-hcell tg-sticky ${className}`} role="columnheader" aria-sort={ariaSort}>
-      <button className="tg-sort" type="button" onClick={()=>changeSort(key)}>
-        <span>{label}</span>{active && <i aria-hidden="true">{sorting.direction === "asc" ? "\u2303" : "\u2304"}</i>}
-      </button>
+      {renderSortButton(label,key)}
     </div>;
   };
 
@@ -226,7 +346,9 @@ export const Gantt: React.FC<Props> = ({tasks,allocatedHeight,allocatedWidth,loa
 
   return <section className={`tg ${compactMode ? "tg-compact" : "tg-detailed"}`} style={rootStyle} aria-label="Tasks Gantt">
     <header className="tg-toolbar">
-      <span className="tg-title"><strong>Tasks Plan</strong><button className="tg-info" type="button" aria-label={`Task Gantt PCF version ${CONTROL_VERSION}`}><span aria-hidden="true">i</span><em>Task Gantt PCF version {CONTROL_VERSION}</em></button></span>
+      <span className="tg-title"><strong>Tasks Plan</strong><button ref={infoButtonRef} className="tg-info" type="button" aria-label={`Task Gantt PCF version ${CONTROL_VERSION}`} aria-expanded={infoOpen} aria-describedby={infoOpen ? overlayId : undefined} onClick={()=>setInfoOpen(open=>!open)}><span aria-hidden="true">i</span></button><button className={`tg-refresh ${refreshing ? "is-refreshing" : ""}`} type="button" title="Refresh tasks" aria-label="Refresh tasks" disabled={refreshDisabled} onClick={onRefresh}>
+        <svg viewBox="0 0 20 20" aria-hidden="true" focusable="false"><path d="M16.9 3.6v4.7h-4.7l1.8-1.8A5.5 5.5 0 0 0 4.5 10H3.2a6.8 6.8 0 0 1 11.7-4.4l2-2Zm-1.4 6.4h1.3A6.8 6.8 0 0 1 5.1 14.4l-2 2v-4.7h4.7L6 13.5a5.5 5.5 0 0 0 9.5-3.5Z"/></svg>
+      </button></span>
       <span className="tg-filters">
         <label className="tg-filter">Created On
           <select value={filters.createdOn} onChange={event=>changeFilters({...filters,createdOn:event.target.value as DateFilter})}>
@@ -262,9 +384,14 @@ export const Gantt: React.FC<Props> = ({tasks,allocatedHeight,allocatedWidth,loa
       <div className="tg-head" style={{gridTemplateColumns:grid}}>
         {renderSortHeader(compactMode ? "Task" : "Task name","task","tg-col-task")}
         {!compactMode && renderSortHeader("Assigned to","assignedTo","tg-col-assigned")}
-        {renderSortHeader("Status","status","tg-col-status")}
+        <div className="tg-hcell tg-sticky tg-col-status" role="columnheader" aria-sort="none">Status</div>
         {!compactMode && renderSortHeader("Start Date","startDate","tg-col-start")}
-        {renderSortHeader(compactMode ? "Schedule" : "Due Date",compactMode ? "startDate" : "dueDate","tg-col-due")}
+        {compactMode
+          ? <div className="tg-hcell tg-sticky tg-col-due tg-schedule-head" role="columnheader" aria-sort={sorting?.key === "startDate" ? (sorting.direction === "asc" ? "ascending" : "descending") : sorting?.key === "dueDate" ? (sorting.direction === "asc" ? "ascending" : "descending") : "none"}>
+              {renderSortButton("Start","startDate")}
+              {renderSortButton("Due","dueDate")}
+            </div>
+          : renderSortHeader("Due Date","dueDate","tg-col-due")}
         <div className="tg-calendar" style={{gridTemplateColumns:timelineGrid}}>
           {dateCells.map((d,i)=><div key={i} className={d.getDay()%6===0?"weekend":""}><b>{d.getDate()}</b><small>{d.toLocaleDateString(undefined,{weekday:"narrow"})}</small></div>)}
           {todayIndex>=0&&todayIndex<numberOfDays&&<em ref={todayRef} className="tg-today" data-tg-today="true" style={{left:`${todayIndex*dayWidth+(dayWidth/2)}px`}}/>}

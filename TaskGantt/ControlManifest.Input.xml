@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8" ?>
 <manifest>
-  <control namespace="Voss" constructor="TaskGantt" version="3.2.0" display-name-key="Task Gantt" description-key="Responsive Gantt view for Dataverse tasks" control-type="virtual">
+  <control namespace="Voss" constructor="TaskGantt" version="3.2.1" display-name-key="Task Gantt" description-key="Responsive Gantt view for Dataverse tasks" control-type="virtual">
     <external-service-usage enabled="true">
       <domain>modern365timeline-license-fkh6gbgdhnchgyhj.westeurope-01.azurewebsites.net</domain>
     </external-service-usage>
