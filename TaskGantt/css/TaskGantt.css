@@ -2,14 +2,16 @@
   --tg-font: clamp(12px, 1.1vw, 14px);
   --tg-task-name-width: 240px;
   --tg-assigned-to-width: 170px;
+  --tg-description-width: 0px;
   --tg-status-width: 105px;
   --tg-start-date-width: 115px;
   --tg-due-date-width: 115px;
   --tg-assigned-to-left: var(--tg-task-name-width);
-  --tg-status-left: calc(var(--tg-task-name-width) + var(--tg-assigned-to-width));
-  --tg-start-date-left: calc(var(--tg-task-name-width) + var(--tg-assigned-to-width) + var(--tg-status-width));
-  --tg-due-date-left: calc(var(--tg-task-name-width) + var(--tg-assigned-to-width) + var(--tg-status-width) + var(--tg-start-date-width));
-  --tg-frozen-columns-width: calc(var(--tg-task-name-width) + var(--tg-assigned-to-width) + var(--tg-status-width) + var(--tg-start-date-width) + var(--tg-due-date-width));
+  --tg-description-left: calc(var(--tg-task-name-width) + var(--tg-assigned-to-width));
+  --tg-status-left: calc(var(--tg-task-name-width) + var(--tg-assigned-to-width) + var(--tg-description-width));
+  --tg-start-date-left: calc(var(--tg-task-name-width) + var(--tg-assigned-to-width) + var(--tg-description-width) + var(--tg-status-width));
+  --tg-due-date-left: calc(var(--tg-task-name-width) + var(--tg-assigned-to-width) + var(--tg-description-width) + var(--tg-status-width) + var(--tg-start-date-width));
+  --tg-frozen-columns-width: calc(var(--tg-task-name-width) + var(--tg-assigned-to-width) + var(--tg-description-width) + var(--tg-status-width) + var(--tg-start-date-width) + var(--tg-due-date-width));
   font: var(--tg-font) "Segoe UI", sans-serif;
   color: #242424;
   background: #fff;
@@ -397,6 +399,20 @@
   left: var(--tg-assigned-to-left);
 }
 
+.tg-col-description {
+  left: var(--tg-description-left);
+  overflow: hidden;
+}
+
+.tg-description {
+  display: block;
+  max-width: 100%;
+  color: #605e5c;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .tg-col-status {
   left: var(--tg-status-left);
 }
@@ -619,6 +635,27 @@
   white-space: nowrap;
 }
 
+.tg-unscheduled {
+  position: absolute;
+  left: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 2;
+  color: #605e5c;
+  background: #f3f2f1;
+  border: 1px dashed #a19f9d;
+  border-radius: 3px;
+  box-sizing: border-box;
+  padding: 2px 6px;
+  font-size: 12px;
+  line-height: 18px;
+  white-space: nowrap;
+}
+
+.tg-schedule .tg-unscheduled-note {
+  color: #605e5c;
+}
+
 .tg-bar.overdue {
   background: repeating-linear-gradient(
     135deg,
@@ -635,6 +672,198 @@
   background: #f4b183;
   border-color: #d97706;
   color: #3b2a00;
+}
+
+/* Summary bar: a bracket spanning the stored dates, or the loaded children's dates when derived. */
+.tg-summary {
+  position: absolute;
+  top: 50%;
+  height: 8px;
+  margin-top: -6px;
+  background: #323130;
+  border-radius: 1px;
+  z-index: 2;
+  box-sizing: border-box;
+}
+
+.tg-summary::before,
+.tg-summary::after {
+  content: "";
+  position: absolute;
+  top: 100%;
+  border-top: 6px solid #323130;
+  border-left: 5px solid transparent;
+  border-right: 5px solid transparent;
+}
+
+.tg-summary::before {
+  left: 0;
+  border-left: 0;
+}
+
+.tg-summary::after {
+  right: 0;
+  border-right: 0;
+}
+
+/* Derived from loaded children only: lighter and dashed, because unloaded children may lie outside it. */
+.tg-summary-derived {
+  background: repeating-linear-gradient(90deg, #8a8886 0, #8a8886 6px, transparent 6px, transparent 10px);
+  border: 1px solid #8a8886;
+}
+
+.tg-summary-derived::before,
+.tg-summary-derived::after {
+  border-top-color: #8a8886;
+}
+
+.tg-milestone {
+  position: absolute;
+  top: 50%;
+  width: 14px;
+  height: 14px;
+  background: #0f6cbd;
+  border: 1px solid #fff;
+  box-shadow: 0 0 0 1px #0f6cbd;
+  transform: translate(-50%, -50%) rotate(45deg);
+  z-index: 3;
+}
+
+.tg-milestone.completed {
+  background: #107c10;
+  box-shadow: 0 0 0 1px #107c10;
+}
+
+.tg-row-summary .tg-link {
+  font-weight: 600;
+}
+
+.tg-toggle,
+.tg-toggle-spacer {
+  flex: 0 0 18px;
+  width: 18px;
+  height: 18px;
+}
+
+.tg-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: #323130;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.tg-toggle:hover {
+  background: #f3f2f1;
+}
+
+.tg-toggle:focus-visible {
+  outline: 2px solid #0f6cbd;
+  outline-offset: 1px;
+}
+
+.tg-parent-note {
+  display: block;
+  max-width: 100%;
+  color: #605e5c;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tg-waiting {
+  color: #605e5c;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.tg-notice {
+  flex: 1 1 100%;
+  color: #8a6100;
+  background: #fff4ce;
+  border: 1px solid #f2c811;
+  border-radius: 3px;
+  padding: 4px 8px;
+  font-size: 12px;
+}
+
+/* Dependency lines: one layer over all rows, above the bars and below the frozen columns. */
+.tg-rows {
+  position: relative;
+  width: max-content;
+  min-width: 100%;
+}
+
+.tg-deps {
+  position: absolute;
+  top: 0;
+  z-index: 4;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.tg-dep {
+  fill: none;
+  stroke: #605e5c;
+  stroke-width: 1.5;
+  pointer-events: stroke;
+}
+
+.tg-dep:hover {
+  stroke: #0f6cbd;
+  stroke-width: 2;
+}
+
+.tg-deps marker path {
+  fill: #605e5c;
+}
+
+/* Drawn to a collapsed parent instead of the hidden task. */
+.tg-dep-collapsed {
+  stroke-dasharray: 4 3;
+}
+
+.tg-dep-count {
+  fill: #323130;
+  font-size: 11px;
+}
+
+.tg-dep-stub {
+  pointer-events: all;
+}
+
+.tg-dep-stub path {
+  fill: none;
+  stroke: #8a8886;
+  stroke-width: 1.5;
+}
+
+.tg-dep-stub circle {
+  fill: #fff;
+  stroke: #8a8886;
+  stroke-width: 1.5;
+}
+
+.tg-actions .tg-deps-toggle.selected {
+  background: #ebf3fc;
+  border-color: #0f6cbd;
+  color: #0f548c;
+}
+
+.tg-deps-status {
+  color: #605e5c;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.tg-deps-status.error {
+  color: #a4262c;
 }
 
 .tg-today {

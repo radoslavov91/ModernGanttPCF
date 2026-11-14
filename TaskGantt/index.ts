@@ -1,8 +1,11 @@
 import { IInputs, IOutputs } from "./generated/ManifestTypes";
 import * as React from "react";
 import { cleanupTaskGanttOverlays, DateFilter, Gantt, LicenseDebugInfo, LicenseState, SortState, sortTasksForDisplay, StatusFilter, TaskItem } from "./src/Gantt";
+import { buildLayout, ColumnLike, FieldMap, GanttLayout, hasHierarchy, isProjectTaskTable, mapRecord, normalizeId, resolveFieldMap, toParentRef } from "./src/fieldMap";
+import { buildHierarchy, Hierarchy } from "./src/hierarchy";
+import { customLinkSource, LinkSource, PROJECT_OPERATIONS_LINKS } from "./src/dependencies";
+import { DependencyLoader, DependencyView, WebApiLike } from "./src/dependencyLoader";
 
-type Column = ComponentFramework.PropertyHelper.DataSetApi.Column;
 type ConditionExpression = ComponentFramework.PropertyHelper.DataSetApi.ConditionExpression;
 type ConditionOperator = ComponentFramework.PropertyHelper.DataSetApi.Types.ConditionOperator;
 type SortStatus = ComponentFramework.PropertyHelper.DataSetApi.SortStatus;
@@ -28,6 +31,10 @@ const DATE_FILTER_OPERATORS: Record<Exclude<DateFilter, "all">, ConditionOperato
   thisMonth: 23
 };
 
+const PROJECT_ENTITY = "msdyn_project";
+const NO_PROJECT_SCOPE = "Dependencies need the current project. Open the Gantt on a project form, or add the Project column to the view.";
+const FLAT_PAGE_SIZE = 10;
+const HIERARCHY_PAGE_SIZE = 50;
 const LICENSE_CACHE_PREFIX = "modernGanttLicense";
 const LICENSE_CACHE_SCHEMA_VERSION = 1;
 const DATAVERSE_CACHE_VERSION = 1;
@@ -36,7 +43,9 @@ const SUPPORT_EMAIL = "support@simetrixconsult.com";
 export class TaskGantt implements ComponentFramework.ReactControl<IInputs, IOutputs> {
   private context!: ComponentFramework.Context<IInputs>;
   private notifyOutputChanged?: () => void;
-  private pageSizeConfigured = false;
+  private configuredPageSize = 0;
+  private lastCycleWarningSignature = "";
+  private dependencyLoader?: DependencyLoader;
   private filters: FilterState = { status: "all", createdOn: "all", dueDate: "all" };
   private sorting: SortState;
   private lastAppliedFilterSignature = "status:all:|createdOn:all|dueDate:all";
@@ -59,7 +68,7 @@ export class TaskGantt implements ComponentFramework.ReactControl<IInputs, IOutp
   private dataverseCacheCheckedForKey = "";
   private dataverseCacheCheckInFlight = false;
 
-  private static readonly BUILD_VERSION = "3.2.1";
+  private static readonly BUILD_VERSION = "3.5.0";
   private static readonly CONTROL_CODE = "moderngantt";
   private static readonly LICENSE_ENDPOINT = "https://modern365timeline-license-fkh6gbgdhnchgyhj.westeurope-01.azurewebsites.net/api/validateLicense";
 
@@ -70,6 +79,7 @@ export class TaskGantt implements ComponentFramework.ReactControl<IInputs, IOutp
     this.context = context;
     this.notifyOutputChanged = notifyOutputChanged;
     context.mode.trackContainerResize(true);
+    this.dependencyLoader = new DependencyLoader(context.webAPI as unknown as WebApiLike, () => this.requestControlRender());
   }
 
   public updateView(context: ComponentFramework.Context<IInputs>): React.ReactElement {
@@ -77,9 +87,12 @@ export class TaskGantt implements ComponentFramework.ReactControl<IInputs, IOutp
     this.ensureLicenseValidation(context);
 
     const ds = context.parameters.tasks;
-    if (!this.pageSizeConfigured) {
-      ds.paging.setPageSize(10);
-      this.pageSizeConfigured = true;
+    const fieldMap = this.getFieldMap(ds);
+    const hierarchyEnabled = hasHierarchy(fieldMap);
+    const pageSize = hierarchyEnabled ? HIERARCHY_PAGE_SIZE : FLAT_PAGE_SIZE;
+    if (this.configuredPageSize !== pageSize) {
+      ds.paging.setPageSize(pageSize);
+      this.configuredPageSize = pageSize;
     }
 
     if (this.manualRefreshInFlight) {
@@ -91,42 +104,40 @@ export class TaskGantt implements ComponentFramework.ReactControl<IInputs, IOutp
       }
     }
 
-    const scheduledStartColumn = this.resolveColumn(ds.columns, "scheduledstart");
-    const createdOnColumn = this.resolveColumn(ds.columns, "createdon");
-    const scheduledEndColumn = this.resolveColumn(ds.columns, "scheduledend");
-    const ownerColumn = this.resolveColumn(ds.columns, "ownerid");
-    const subjectColumn = this.resolveColumn(ds.columns, "subject");
-    const stateColumn = this.resolveColumn(ds.columns, "statecode");
-    if (this.filters.status === "all" && stateColumn && ds.sortedRecordIds.length) {
+    const stateColumn = fieldMap.columns.status;
+    if (fieldMap.isTaskTable && this.filters.status === "all" && stateColumn && ds.sortedRecordIds.length) {
       this.observeStatusValues(ds, stateColumn);
     }
 
-    const mappedTasks: TaskItem[] = ds.sortedRecordIds.map((id: string) => {
-      const r = ds.records[id];
-      const value = (column?: Column) => column ? r.getValue(column.name) as string | Date | null : null;
-      const formatted = (column?: Column) => column ? r.getFormattedValue(column.name) : "";
-      const formattedState = formatted(stateColumn) || "Active";
-      const status: TaskItem["status"] = formattedState.toLowerCase() === "completed" ? "Completed" : "Active";
-      const scheduledStart = value(scheduledStartColumn);
-      const createdOn = value(createdOnColumn);
-      const startValue = scheduledStart || createdOn;
-      return {
-        recordId: id,
-        name: formatted(subjectColumn) || "(Unnamed task)",
-        assignedTo: formatted(ownerColumn) || "Unassigned",
-        status,
-        start: new Date(startValue as string | Date),
-        due: new Date(value(scheduledEndColumn) as string | Date)
-      };
-    });
+    const completedRawValue = this.getCompletedRawValue(fieldMap);
+    const mappedTasks: TaskItem[] = ds.sortedRecordIds.map((id: string) => mapRecord(id, ds.records[id], fieldMap, completedRawValue));
     const tasks: TaskItem[] = sortTasksForDisplay(mappedTasks, this.sorting);
     this.logSortDiagnostics(mappedTasks, tasks);
+
+    let layout: GanttLayout = buildLayout(fieldMap);
+    let hierarchy: Hierarchy | undefined;
+    if (hierarchyEnabled) {
+      // A user sort orders siblings; otherwise the mapped sequence does, falling back to the server order.
+      hierarchy = buildHierarchy(tasks, { entityType: ds.getTargetEntityType?.(), useSequence: !this.sorting && Boolean(fieldMap.columns.sequence) });
+      if (hierarchy.mismatchedTarget) {
+        layout = { ...layout, notice: `The Parent column points to the ${hierarchy.mismatchedTarget} table, so rows are shown without a hierarchy. Map a lookup to this table.` };
+        hierarchy = undefined;
+      } else {
+        this.warnBrokenCycles(hierarchy.brokenCycleIds);
+      }
+    }
 
     const allocatedWidth = Number(context.mode.allocatedWidth) || 0;
     const allocatedHeight = Number(context.mode.allocatedHeight) || 0;
 
+    const dependencies = this.getDependencies(context, ds);
+
     return React.createElement(Gantt, {
       tasks,
+      hierarchy,
+      dependencies,
+      pageSize,
+      layout,
       allocatedHeight,
       allocatedWidth,
       loading: ds.loading,
@@ -374,11 +385,59 @@ export class TaskGantt implements ComponentFramework.ReactControl<IInputs, IOutp
     this.ensureLicenseValidation(this.context);
   }
 
-  private resolveColumn(columns: Column[], propertySetAlias: string): Column | undefined {
-    return columns.find(column => column.alias === propertySetAlias) || columns.find(column => column.name === propertySetAlias);
+  private getFieldMap(ds: ComponentFramework.PropertyTypes.DataSet): FieldMap {
+    return resolveFieldMap(ds.columns, ds.getTargetEntityType?.());
   }
 
-  private observeStatusValues(ds: ComponentFramework.PropertyTypes.DataSet, stateColumn: Column): void {
+  // Dependency lines: explicit custom link-table settings win; Project Operations tasks use the verified defaults.
+  // Returns undefined when no link source applies, so existing configurations render exactly as before.
+  private getDependencies(context: ComponentFramework.Context<IInputs>, ds: ComponentFramework.PropertyTypes.DataSet): DependencyView | undefined {
+    const parameters = context.parameters as unknown as Record<string, { raw?: unknown } | undefined>;
+    const text = (name: string) => (typeof parameters[name]?.raw === "string" ? parameters[name]?.raw as string : "");
+    if (text("dependencyMode").trim().toLowerCase() === "off") return undefined;
+
+    const custom = customLinkSource({ table: text("dependencyTable"), predecessorColumn: text("dependencyPredecessorColumn"), successorColumn: text("dependencySuccessorColumn") });
+    if (custom.error) return { status: "error", links: [], skipped: [], message: custom.error };
+    const source: LinkSource | undefined = custom.source ?? (isProjectTaskTable(ds.getTargetEntityType?.()) ? PROJECT_OPERATIONS_LINKS : undefined);
+    if (!source || !this.dependencyLoader) return undefined;
+    if (!ds.sortedRecordIds.length) return { status: "ready", links: [], skipped: [] };
+
+    let scopeId: string | undefined;
+    if (source.kind === "projectOperations") {
+      scopeId = this.getProjectScope(context, ds);
+      if (!scopeId) return { status: "error", links: [], skipped: [], message: NO_PROJECT_SCOPE };
+    }
+    this.dependencyLoader.sync(source, scopeId, ds.sortedRecordIds);
+    return this.dependencyLoader.view();
+  }
+
+  // The project hosting the Gantt (project form), or the single project of the loaded tasks when the view includes it.
+  private getProjectScope(context: ComponentFramework.Context<IInputs>, ds: ComponentFramework.PropertyTypes.DataSet): string | undefined {
+    const info = (context.mode as unknown as { contextInfo?: { entityTypeName?: string; entityId?: string } }).contextInfo;
+    if (info?.entityTypeName?.toLowerCase() === PROJECT_ENTITY && info.entityId) return normalizeId(info.entityId);
+    if (!ds.columns.some(column => column.name === PROJECT_ENTITY)) return undefined;
+    const projects = new Set(ds.sortedRecordIds
+      .map((id: string) => toParentRef(ds.records[id].getValue(PROJECT_ENTITY), "")?.id)
+      .filter((id): id is string => Boolean(id)));
+    return projects.size === 1 ? Array.from(projects)[0] : undefined;
+  }
+
+  private warnBrokenCycles(recordIds: string[]): void {
+    const signature = recordIds.join("|");
+    if (signature === this.lastCycleWarningSignature) return;
+    this.lastCycleWarningSignature = signature;
+    if (recordIds.length) {
+      console.warn(`TaskGantt found ${recordIds.length} row(s) whose parent forms a loop or points to itself. They are shown at the top level.`, recordIds);
+    }
+  }
+
+  // Known raw values (standard Task statecode) win over values observed from formatted labels. Label observation
+  // is kept only for Tasks; custom tables get no Completed value until it can be configured explicitly.
+  private getCompletedRawValue(fieldMap: FieldMap): string | undefined {
+    return fieldMap.completedRawValue ?? (fieldMap.isTaskTable ? this.completedRawValue : undefined);
+  }
+
+  private observeStatusValues(ds: ComponentFramework.PropertyTypes.DataSet, stateColumn: ColumnLike): void {
     ds.sortedRecordIds.forEach((id: string) => {
       const record = ds.records[id];
       const rawValue = record.getValue(stateColumn.name);
@@ -410,9 +469,11 @@ export class TaskGantt implements ComponentFramework.ReactControl<IInputs, IOutp
   }
 
   private applyFilters(ds: ComponentFramework.PropertyTypes.DataSet, filters: FilterState): void {
-    const signature = this.getFilterSignature(filters);
+    const fieldMap = this.getFieldMap(ds);
+    const completedRawValue = this.getCompletedRawValue(fieldMap);
+    const signature = this.getFilterSignature(filters, completedRawValue);
     if (signature === this.lastAppliedFilterSignature) return;
-    const conditions = this.buildFilterConditions(ds.columns, filters);
+    const conditions = this.buildFilterConditions(fieldMap, completedRawValue, filters);
 
     this.filters = filters;
     this.lastAppliedFilterSignature = signature;
@@ -430,31 +491,31 @@ export class TaskGantt implements ComponentFramework.ReactControl<IInputs, IOutp
     ds.refresh();
   }
 
-  private buildFilterConditions(columns: Column[], filters: FilterState): ConditionExpression[] {
+  private buildFilterConditions(fieldMap: FieldMap, completedRawValue: string | undefined, filters: FilterState): ConditionExpression[] {
     const conditions: ConditionExpression[] = [];
-    const stateColumn = this.resolveColumn(columns, "statecode");
-    const createdOnColumn = this.resolveColumn(columns, "createdon");
-    const dueDateColumn = this.resolveColumn(columns, "scheduledend");
+    const stateColumn = fieldMap.columns.status;
+    const createdOnColumn = fieldMap.columns.createdOn;
+    const dueDateColumn = fieldMap.columns.finish;
 
     if (filters.status !== "all" && !stateColumn) {
       console.warn("TaskGantt could not resolve the mapped Status dataset column. Status condition was skipped.");
     }
 
     if (filters.status !== "all" && stateColumn) {
-      if (!this.completedRawValue) {
+      if (!completedRawValue) {
         console.warn(`TaskGantt could not resolve a raw Dataverse value for Completed. The ${filters.status} status filter was skipped.`);
       } else {
         if (filters.status === "completed") {
           conditions.push({
             attributeName: stateColumn.name,
             conditionOperator: 0,
-            value: this.completedRawValue
+            value: completedRawValue
           });
         } else {
           conditions.push({
             attributeName: stateColumn.name,
             conditionOperator: 1,
-            value: this.completedRawValue
+            value: completedRawValue
           });
           if (filters.status === "overdue") {
             if (!dueDateColumn) {
@@ -476,7 +537,7 @@ export class TaskGantt implements ComponentFramework.ReactControl<IInputs, IOutp
     return conditions;
   }
 
-  private addDateCondition(conditions: ConditionExpression[], column: Column | undefined, filter: DateFilter): void {
+  private addDateCondition(conditions: ConditionExpression[], column: ColumnLike | undefined, filter: DateFilter): void {
     if (filter === "all" || !column) return;
     conditions.push({
       attributeName: column.name,
@@ -485,17 +546,18 @@ export class TaskGantt implements ComponentFramework.ReactControl<IInputs, IOutp
     });
   }
 
-  private getFilterSignature(filters: FilterState): string {
-    const completedSignature = filters.status === "all" ? "" : this.completedRawValue || "";
+  private getFilterSignature(filters: FilterState, completedRawValue: string | undefined): string {
+    const completedSignature = filters.status === "all" ? "" : completedRawValue || "";
     return `status:${filters.status}:${completedSignature}|createdOn:${filters.createdOn}|dueDate:${filters.dueDate}`;
   }
 
   private applySorting(ds: ComponentFramework.PropertyTypes.DataSet, sorting: SortState): void {
-    const columns: Record<NonNullable<SortState>["key"], Column | undefined> = {
-      task: this.resolveColumn(ds.columns, "subject"),
-      assignedTo: this.resolveColumn(ds.columns, "ownerid"),
-      startDate: this.resolveColumn(ds.columns, "scheduledstart"),
-      dueDate: this.resolveColumn(ds.columns, "scheduledend")
+    const fieldMap = this.getFieldMap(ds);
+    const columns: Record<NonNullable<SortState>["key"], ColumnLike | undefined> = {
+      task: fieldMap.columns.title,
+      assignedTo: fieldMap.columns.owner,
+      startDate: fieldMap.columns.start,
+      dueDate: fieldMap.columns.finish
     };
     const column = sorting ? columns[sorting.key] : undefined;
 
@@ -542,7 +604,8 @@ export class TaskGantt implements ComponentFramework.ReactControl<IInputs, IOutp
   private getRedactedSortDiagnosticValue(task: TaskItem): { recordId: string; value: string | number | null } {
     if (!this.sorting) return { recordId: task.recordId, value: null };
     if (this.sorting.key === "startDate" || this.sorting.key === "dueDate") {
-      const value = this.sorting.key === "startDate" ? task.start.getTime() : task.due.getTime();
+      const date = this.sorting.key === "startDate" ? task.start : task.due;
+      const value = date ? date.getTime() : Number.NaN;
       return { recordId: task.recordId, value: Number.isNaN(value) ? null : value };
     }
 
@@ -555,6 +618,8 @@ export class TaskGantt implements ComponentFramework.ReactControl<IInputs, IOutp
     if (ds.loading || this.manualRefreshInFlight) return;
     this.manualRefreshInFlight = true;
     this.manualRefreshSawLoading = false;
+    // Links may have changed too; drop the cache so the refreshed rows are read again.
+    this.dependencyLoader?.reset();
     this.requestControlRender();
     ds.refresh();
   }
@@ -651,6 +716,7 @@ export class TaskGantt implements ComponentFramework.ReactControl<IInputs, IOutp
   public destroy(): void {
     this.clearLicenseWatchdog();
     this.activeLicenseAbortController?.abort();
+    this.dependencyLoader?.reset();
     cleanupTaskGanttOverlays(this.instanceId);
   }
 }

@@ -1,0 +1,31 @@
+{
+  "_comment": "msdyn_projecttaskdependency rows as returned by the Web API. Link-type values verified in org3b1c1cb9 on 2026-11-14: msdyn_linktype 192350000 FS, 192350001 SS, 192350002 FF, 192350004 SF; mirror msdyn_projecttaskdependencylinktype 0 FF, 1 FS, 2 SF, 3 SS. The Planning Activities links and dates are project 555's real data; the SS/FF/SF links are synthetic (every live link is Finish-to-Start).",
+  "project": "f5ec7bcf-247c-4118-9ccb-e75ae5abedba",
+  "tasks": [
+    { "id": "ccfa8f7e-b709-48ad-815d-2172ed324f99", "name": "555 - Planning Activities", "start": "2026-09-01", "finish": "2026-10-13", "summary": true, "parent": null, "sequence": 2 },
+    { "id": "6d5d2920-e921-42fb-a545-981d2573928d", "name": "555 - Building Permits - renamed", "start": "2026-09-01", "finish": "2026-09-15", "summary": false, "parent": "ccfa8f7e-b709-48ad-815d-2172ed324f99", "sequence": 3 },
+    { "id": "06f07a38-0db3-4bfc-aa88-44d0683c9d10", "name": "555 - Deed Reviews", "start": "2026-09-15", "finish": "2026-09-21", "summary": false, "parent": "ccfa8f7e-b709-48ad-815d-2172ed324f99", "sequence": 4 },
+    { "id": "bf1feeb9-c752-41ba-9610-534657efedde", "name": "555 - Store Design", "start": "2026-09-22", "finish": "2026-10-02", "summary": false, "parent": "ccfa8f7e-b709-48ad-815d-2172ed324f99", "sequence": 5 },
+    { "id": "ded3f7e9-87cf-4c66-9ed8-037c97163e0c", "name": "555 - Material Sourcing", "start": "2026-10-05", "finish": "2026-10-13", "summary": false, "parent": "ccfa8f7e-b709-48ad-815d-2172ed324f99", "sequence": 6 },
+    { "id": "384e0e0d-b174-411c-81ae-19020df7144e", "name": "555 - Project Inspection", "start": "2026-10-05", "finish": "2026-12-23", "summary": true, "parent": null, "sequence": 7 },
+    { "id": "378d9bfb-346d-411f-8d50-b14f8fcb2763", "name": "555 - Health & Safety inspection", "start": "2026-10-05", "finish": "2026-10-19", "summary": false, "parent": "384e0e0d-b174-411c-81ae-19020df7144e", "sequence": 8 },
+    { "id": "4e8eb830-0b67-400b-9f2c-d77ffaac7fcd", "name": "555 - Hazardous materials inspection", "start": "2026-10-19", "finish": "2026-10-26", "summary": false, "parent": "384e0e0d-b174-411c-81ae-19020df7144e", "sequence": 9 }
+  ],
+  "links": [
+    { "msdyn_projecttaskdependencyid": "5743710e-afb9-4e16-9ef2-2e9856aeb300", "_msdyn_predecessortask_value": "6d5d2920-e921-42fb-a545-981d2573928d", "_msdyn_predecessortask_value@OData.Community.Display.V1.FormattedValue": "555 - Building Permits - renamed", "_msdyn_successortask_value": "06f07a38-0db3-4bfc-aa88-44d0683c9d10", "_msdyn_successortask_value@OData.Community.Display.V1.FormattedValue": "555 - Deed Reviews", "msdyn_linktype": 192350000, "msdyn_projecttaskdependencylinktype": 1 },
+    { "msdyn_projecttaskdependencyid": "73d6dbe6-3ac3-4302-81fb-f2d77a205e17", "_msdyn_predecessortask_value": "06f07a38-0db3-4bfc-aa88-44d0683c9d10", "_msdyn_predecessortask_value@OData.Community.Display.V1.FormattedValue": "555 - Deed Reviews", "_msdyn_successortask_value": "bf1feeb9-c752-41ba-9610-534657efedde", "_msdyn_successortask_value@OData.Community.Display.V1.FormattedValue": "555 - Store Design", "msdyn_linktype": 192350000, "msdyn_projecttaskdependencylinktype": 1 },
+    { "msdyn_projecttaskdependencyid": "c9b062fe-cacd-494f-a434-72e0255f1997", "_msdyn_predecessortask_value": "bf1feeb9-c752-41ba-9610-534657efedde", "_msdyn_predecessortask_value@OData.Community.Display.V1.FormattedValue": "555 - Store Design", "_msdyn_successortask_value": "ded3f7e9-87cf-4c66-9ed8-037c97163e0c", "_msdyn_successortask_value@OData.Community.Display.V1.FormattedValue": "555 - Material Sourcing", "msdyn_linktype": 192350000, "msdyn_projecttaskdependencylinktype": 1 },
+    { "msdyn_projecttaskdependencyid": "d56a85cd-b13e-4f9f-83aa-1678a39b7c17", "_msdyn_predecessortask_value": "378d9bfb-346d-411f-8d50-b14f8fcb2763", "_msdyn_predecessortask_value@OData.Community.Display.V1.FormattedValue": "555 - Health & Safety inspection", "_msdyn_successortask_value": "4e8eb830-0b67-400b-9f2c-d77ffaac7fcd", "_msdyn_successortask_value@OData.Community.Display.V1.FormattedValue": "555 - Hazardous materials inspection", "msdyn_linktype": 192350000, "msdyn_projecttaskdependencylinktype": 1 }
+  ],
+  "typeVariants": [
+    { "label": "FS", "msdyn_linktype": 192350000, "msdyn_projecttaskdependencylinktype": 1 },
+    { "label": "SS", "msdyn_linktype": 192350001, "msdyn_projecttaskdependencylinktype": 3 },
+    { "label": "FF", "msdyn_linktype": 192350002, "msdyn_projecttaskdependencylinktype": 0 },
+    { "label": "SF", "msdyn_linktype": 192350004, "msdyn_projecttaskdependencylinktype": 2 }
+  ],
+  "invalidVariants": [
+    { "expect": "unknownType", "value": "192350003", "msdyn_linktype": 192350003, "msdyn_projecttaskdependencylinktype": 1 },
+    { "expect": "unknownType", "value": "(empty)", "msdyn_linktype": null, "msdyn_projecttaskdependencylinktype": 1 },
+    { "expect": "conflictingType", "value": "192350000/3", "msdyn_linktype": 192350000, "msdyn_projecttaskdependencylinktype": 3 }
+  ]
+}

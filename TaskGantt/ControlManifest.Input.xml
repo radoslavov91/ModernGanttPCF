@@ -1,18 +1,45 @@
 <?xml version="1.0" encoding="utf-8" ?>
 <manifest>
-  <control namespace="Voss" constructor="TaskGantt" version="3.2.1" display-name-key="Task Gantt" description-key="Responsive Gantt view for Dataverse tasks" control-type="virtual">
+  <control namespace="Voss" constructor="TaskGantt" version="3.5.0" display-name-key="Task Gantt" description-key="Responsive Gantt view for Dataverse tasks" control-type="virtual">
     <external-service-usage enabled="true">
       <domain>modern365timeline-license-fkh6gbgdhnchgyhj.westeurope-01.azurewebsites.net</domain>
     </external-service-usage>
+    <!-- Property-set names are the binding contract with existing forms. Never rename them. -->
+    <type-group name="scheduleDates">
+      <type>DateAndTime.DateAndTime</type>
+      <type>DateAndTime.DateOnly</type>
+    </type-group>
+    <type-group name="descriptionText">
+      <type>SingleLine.Text</type>
+      <type>SingleLine.TextArea</type>
+      <type>Multiple</type>
+    </type-group>
+    <type-group name="sequenceNumber">
+      <type>Whole.None</type>
+      <type>Decimal</type>
+      <type>FP</type>
+    </type-group>
     <data-set name="tasks" display-name-key="Tasks" cds-data-set-options="displayCommandBar:false;displayViewSelector:false;displayQuickFind:false">
-      <property-set name="subject" display-name-key="Task name" description-key="Task subject" of-type="SingleLine.Text" usage="bound" required="true" />
-      <property-set name="scheduledend" display-name-key="Due Date" description-key="Scheduled end" of-type="DateAndTime.DateAndTime" usage="bound" required="true" />
-      <property-set name="ownerid" display-name-key="Assigned to" description-key="Task owner" of-type="Lookup.Owner" usage="bound" required="true" />
-      <property-set name="statecode" display-name-key="Status" description-key="Task status" of-type="OptionSet" usage="bound" required="true" />
-      <property-set name="scheduledstart" display-name-key="Start Date" description-key="Scheduled start" of-type="DateAndTime.DateAndTime" usage="bound" required="true" />
-      <property-set name="createdon" display-name-key="Created On" description-key="Created on" of-type="DateAndTime.DateAndTime" usage="bound" required="true" />
+      <property-set name="subject" display-name-key="Title" description-key="Record title. For Tasks, use Subject." of-type="SingleLine.Text" usage="bound" required="true" />
+      <property-set name="scheduledend" display-name-key="Finish" description-key="Finish or due date (Date Only or Date and Time). For Tasks, use Due Date." of-type-group="scheduleDates" usage="bound" required="true" />
+      <property-set name="ownerid" display-name-key="Owner (optional)" description-key="Optional owner. The column is hidden when not mapped." of-type="Lookup.Owner" usage="bound" required="false" />
+      <property-set name="statecode" display-name-key="Status (optional)" description-key="Optional status. The column and status filter are hidden when not mapped." of-type="OptionSet" usage="bound" required="false" />
+      <property-set name="scheduledstart" display-name-key="Start" description-key="Start date (Date Only or Date and Time). For Tasks, use Start Date." of-type-group="scheduleDates" usage="bound" required="true" />
+      <property-set name="createdon" display-name-key="Created On (optional)" description-key="Optional. Enables the Created On filter. For Tasks it is also the start fallback." of-type="DateAndTime.DateAndTime" usage="bound" required="false" />
+      <property-set name="description" display-name-key="Description (optional)" description-key="Optional description column. Hidden when not mapped." of-type-group="descriptionText" usage="bound" required="false" />
+      <property-set name="parent" display-name-key="Parent (optional)" description-key="Optional lookup to the parent row in the same table. Enables expandable rows and summary bars." of-type="Lookup.Simple" usage="bound" required="false" />
+      <property-set name="milestone" display-name-key="Milestone (optional)" description-key="Optional Yes/No column. Rows set to Yes show a milestone diamond on the Finish date." of-type="TwoOptions" usage="bound" required="false" />
+      <property-set name="sequence" display-name-key="Sequence (optional)" description-key="Optional number that orders rows under the same parent when no column sort is chosen." of-type-group="sequenceNumber" usage="bound" required="false" />
     </data-set>
     <property name="licenseKey" display-name-key="License Key" description-key="License key used to activate the control" of-type="SingleLine.Text" usage="input" required="false" />
+    <!-- Dependency lines (read-only). Project Operations tasks use their dependency table automatically; other tables opt in. -->
+    <property name="dependencyMode" display-name-key="Dependency lines" description-key="Auto shows dependency lines for Project Operations tasks or a configured link table. Off hides them." of-type="Enum" usage="input" required="false" default-value="auto">
+      <value name="auto" display-name-key="Auto">auto</value>
+      <value name="off" display-name-key="Off">off</value>
+    </property>
+    <property name="dependencyTable" display-name-key="Dependency table (optional)" description-key="Logical name of a custom link table. Links are drawn Finish-to-Start." of-type="SingleLine.Text" usage="input" required="false" />
+    <property name="dependencyPredecessorColumn" display-name-key="Predecessor column (optional)" description-key="Logical name of the lookup column on the link table that points to the predecessor row." of-type="SingleLine.Text" usage="input" required="false" />
+    <property name="dependencySuccessorColumn" display-name-key="Successor column (optional)" description-key="Logical name of the lookup column on the link table that points to the successor row." of-type="SingleLine.Text" usage="input" required="false" />
     <resources>
       <code path="index.ts" order="1" />
       <platform-library name="React" version="16.14.0" />
