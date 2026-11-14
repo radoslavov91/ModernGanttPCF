@@ -24,9 +24,9 @@ Read-only dependency lines.
 
 ### Link types
 
-- **Finish-to-Start was verified live**: all 294 readable Project Operations links in the trial
-  (`msdyn_linktype` 192350000, mirror value 1) and the custom Gantt Test Link in sandbox-simetrix are Finish-to-Start,
-  and the deployed 3.5.0 control's link query returned the expected links in both environments.
+- **Finish-to-Start was verified live**, including on-screen rendering in both environments (see Live acceptance).
+  All 294 readable Project Operations links in the trial (`msdyn_linktype` 192350000, mirror value 1) and the custom
+  Gantt Test Link in sandbox-simetrix are Finish-to-Start.
 - **Start-to-Start, Finish-to-Finish and Start-to-Finish were tested with fixtures only**
   (`tests/fixtures/po-dependencies.json`); no live data of these types exists.
 
@@ -42,9 +42,10 @@ Read-only dependency lines.
 
 | Environment | Result |
 | --- | --- |
-| sandbox-simetrix | 3.5.0 pushed after a clean pending-changes check; live control 3.5.0 with the bundle hash above. Gantt Test Link table with one Finish-to-Start link (P2 Child A - Design → P2 Child B - Build); the Phase 2 Gantt on the Gantt Test form is configured for it and the control's link query returns it. The Flat Gantt stays unconfigured. |
-| org3b1c1cb9 (Project Operations trial) | Still on ModernGantt 1.0.0.9 / control 3.4.0; the 1.0.0.10 import has not been done. Link-type data verified read-only (project 555: 21 Finish-to-Start links). |
-| Browser check | The on-screen line rendering has not yet been recorded in either environment. |
+| sandbox-simetrix, deployment | 3.5.0 pushed after a clean pending-changes check; live control 3.5.0 with the bundle hash above. Gantt Test Link table with one Finish-to-Start link (P2 Child A - Design → P2 Child B - Build); the Phase 2 Gantt on the Gantt Test form is configured for it and the control's link query returns it. The Flat Gantt stays unconfigured. |
+| sandbox-simetrix, browser | The Phase 2 Gantt on the Gantt Test form rendered the Finish-to-Start arrow from P2 Child A - Design (finish 27 Nov) to P2 Child B - Build (start 30 Nov). |
+| org3b1c1cb9 (Project Operations trial), browser | Managed ModernGantt 1.0.0.10 imported; control 3.5.0 confirmed on project 555 (GanttTestPO, Modern Gantt Test form). Store Design → Material Sourcing showed the correct Finish-to-Start arrow and tooltip. The links-to-rows-not-loaded notice cleared after paging, and collapsing Planning Activities hid its internal links. |
+| Start-to-Start, Finish-to-Finish, Start-to-Finish | Fixture-tested only; no live data of these types exists. |
 
 ## 3.4.0 (managed solution ModernGantt 1.0.0.9)
 
