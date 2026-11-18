@@ -49,10 +49,25 @@ column is in the view. Missing hierarchy columns are named in a notice and their
 | Milestone | `msdyn_ismilestone` |
 | Sequence | `msdyn_displaysequence` |
 
-Project Operations completion is **not yet configured or verified**. An Active state alone may not mean the task is
-unfinished, so the control does not assume it, and rows stay neutral until completion is configured (see Deadline
-colours). The progress column's metadata and actual value range will be checked in the Project Operations trial before
-a completion threshold is chosen.
+Project Operations has no built-in completion in the control: an Active state alone does not mean the task is
+unfinished, so rows stay neutral until completion is configured. Verified completion settings (simetrix_demo trial,
+2026-11-18):
+
+| Property | Value |
+| --- | --- |
+| `progressColumn` | `msdyn_progress` (must be in the bound view; names match regardless of case) |
+| `progressCompleteValue` | `100` |
+
+- `msdyn_progress` ("% Complete") is a Decimal, 0 to 100, 2 decimals, stored as a **percentage**. Tasks whose completed
+  effort equals their planned effort store exactly 100 (32/32 h and 64/64 h); summary tasks store completed effort ÷
+  planned effort × 100 (32/272 = 11.76, 64/392 = 16.33).
+- A manually typed % Complete on the Task details form was rejected by the scheduling service
+  (`ScheduleAPI-SRV-0008`, "The value provided for msdyn_progress in Project Task is invalid"), even with the project's
+  **Allow percent complete update** set to Yes. Progress for these tasks comes from the scheduling service; the Gantt
+  only reads it. That project setting is forced to No and locked on projects linked to a sales order.
+- On a project form, bind **Parent** to `msdyn_parenttask`. A different lookup (for example `msdyn_projectsprint`)
+  leaves the Gantt flat. After publishing a form change, reload the browser page fully: the client may keep the
+  previous form definition until then.
 
 ## Deadline colours
 
@@ -64,7 +79,19 @@ bar, no row is overdue and the footer says **Deadline colours off: completion no
 | `completedStatusValues` | Raw values of the mapped Status column that mean Completed, comma separated (for example `5` for Task Status Reason Completed). Every other value is open. |
 | `canceledStatusValues` | Raw values that mean Canceled. Optional; requires Completed values. |
 | `progressColumn` | Logical name of a number column in the view. A row is Completed when it reaches `progressCompleteValue` (default 100; use 1 for fractions). Takes precedence over status values. |
-| `dueSoonDays` / `dueNearDays` / `dueImminentDays` | Days before Finish at which open rows turn yellow / orange / dark orange. Defaults 2 / 1 / 0 (the 3.6.0 two-day due-soon boundary). Must not increase. |
+| `dueSoonDays` / `dueNearDays` / `dueImminentDays` | Days before Finish at which open rows turn yellow / orange / dark orange. Product defaults 2 / 1 / 0 (the 3.6.0 two-day due-soon boundary). Must not increase. |
+
+The product defaults apply when these properties are empty. A configuration may choose wider windows; the simetrix_demo
+trial uses 20 / 10 / 5 days on its Project Tasks Gantts. That is a site setting, not a default.
+
+### Where the Gantt is bound
+
+- **Forms:** a subgrid on a form (for example the project Information form) with its own property values per device
+  type.
+- **Views:** observed in the simetrix_demo trial, the Gantt can be bound to one view of a table: the view
+  "Modern Gantt Test - Project Tasks" carries the control in its own `layoutxml` (`controlDescriptions` with the Gantt's
+  parameters), and other views of `msdyn_projecttask` keep the standard grid. Microsoft's documentation describes only
+  the table-wide route (Controls tab), which applies to every view of the table.
 
 - Open rows are blue, then yellow, orange and dark orange as Finish approaches, and red from the day after Finish.
   A task due today is dark orange, never overdue. Completed rows are green with a check mark, canceled rows grey.

@@ -80,6 +80,56 @@ the real Dynamics layers.
 Deleting the table removes its rows, views, form and binding; then remove the two app components (if still listed) and
 delete the `GanttStandaloneTest` solution.
 
+### Project Operations verification (simetrix_demo trial, 2026-11-18)
+
+Configuration and documentation only; no control release and no task data changed by these checks.
+
+**Completion scale (verified).** `msdyn_projecttask.msdyn_progress` ("% Complete") is a Decimal, 0 to 100, 2 decimals,
+stored as a percentage:
+
+| Task (project 888) | Stored `msdyn_progress` | Effort completed / planned |
+| --- | --- | --- |
+| 888 - Building Permits | 100 | 32 / 32 h |
+| 888 - Customer satisfaction inspection | 100 | 64 / 64 h |
+| 888 - Planning Activities (summary) | 11.76 | 32 / 272 h |
+| 888 - Project Inspection (summary) | 16.33 | 64 / 392 h |
+
+Completion settings for Project Operations tasks: `progressColumn = msdyn_progress`, `progressCompleteValue = 100`.
+Earlier checks in the same trial: a % Complete typed on the Task details form is rejected by the scheduling service
+(`ScheduleAPI-SRV-0008`) even with **Allow percent complete update** = Yes; that form divides the typed value by 100
+before calling `msdyn_ExecuteOperationSetV3`. The project setting is forced to No and locked when a project has a sales
+order.
+
+**Gantt settings found in the trial (control 3.7.1).**
+
+| Where | `progressColumn` | `progressCompleteValue` | Warning days (yellow / orange / dark orange) |
+| --- | --- | --- | --- |
+| Project form "Information" (`105ef076-a72a-4382-bde5-35e3c3d9db40`), web, tablet and phone | `msdyn_Progress` | 100 | 20 / 10 / 5 |
+| View "Modern Gantt Test - Project Tasks" (`c8f9b954-a6df-f111-84e8-70a8a505d0b6`) | `msdyn_progress` | 100 | 20 / 10 / 5 |
+| Project form "Modern Gantt Test" | not set (neutral rows) | not set | product defaults |
+
+20 / 10 / 5 days is the trial's own setting; the product defaults remain 2 / 1 / 0. The `msdyn_Progress` casing is
+accepted (column names match regardless of case).
+
+**View-specific binding (observed).** The trial binds the Gantt to a single view: "Modern Gantt Test - Project Tasks"
+carries the control in its `layoutxml` (`controlDescriptions`), while other views of `msdyn_projecttask` keep the
+standard grid and no table-level Gantt binding exists. Microsoft's documentation only describes the table-wide route.
+
+**Project form Parent binding corrected.** The Information form's Gantt bound Parent to `msdyn_projectsprint` (a sprint
+lookup with no values), so the hierarchy stayed flat.
+
+- Changed `<parent>` to `msdyn_parenttask` for web, tablet and phone (3 values); the draft was checked to differ from the
+  published form only by those values, and only the project table's customizations were published (`PublishXml`
+  entity `msdyn_project`; no other project form or view had drafts).
+- Added `msdyn_parenttask` to the bound view "All Project Tasks" (`1a0f550d-9c2b-4007-82e0-e52c06f59c88`, column and
+  layout cell) and published the project task table's customizations (no other project task form or view had drafts).
+  Bound columns that are not in the view (display sequence) did reach the dataset, so this addition may not have been
+  strictly required.
+- After a full page reload (the client kept the previous form definition until then), project 888's Gantt shows the
+  hierarchy: 32 tasks in 5 summary groups with 27 children, matching the stored outline levels, no notices, and the two
+  completed tasks green. The standalone view "Modern Gantt Test - Project Tasks" already bound Parent to
+  `msdyn_parenttask`.
+
 ## 3.7.0 (managed solution ModernGantt 1.0.0.12)
 
 Refined appearance, localized status filters, deadline colours and the overdue indicator.
@@ -101,7 +151,7 @@ Refined appearance, localized status filters, deadline colours and the overdue i
   `dueImminentDays`, defaults 2/1/0, keeping 3.6.0's two-day due-soon boundary) and red when overdue; completed green,
   canceled grey; summary bars unchanged. Invalid settings switch colours off with a notice. Configured values are
   checked against metadata options.
-- **Project Operations.** Completion is not yet configured or verified. An Active state alone may not mean unfinished,
+- **Project Operations.** (Since verified: percentage scale, `progressCompleteValue = 100`; see 3.7.1.) Completion was not yet configured or verified. An Active state alone may not mean unfinished,
   so nothing is assumed; project tasks stay neutral until completion is configured, and the footer says so. The progress
   column's metadata and actual value range will be checked in the trial (org3b1c1cb9) before choosing the completion
   threshold.
