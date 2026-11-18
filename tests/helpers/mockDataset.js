@@ -78,12 +78,15 @@ function makeDataset({ entityType, columns, rows, hasNextPage = false, loading =
   return { ds, calls };
 }
 
-function makeContext(ds, { licenseKey = "", allocatedWidth = 1200 } = {}) {
+// parameters adds input properties by name ({ completedStatusValues: "5" }); offsetMinutes is the Dynamics user zone.
+function makeContext(ds, { licenseKey = "", allocatedWidth = 1200, parameters = {}, offsetMinutes, utils } = {}) {
   return {
-    parameters: { tasks: ds, licenseKey: { raw: licenseKey } },
+    parameters: { tasks: ds, licenseKey: { raw: licenseKey }, ...Object.fromEntries(Object.entries(parameters).map(([name, raw]) => [name, { raw }])) },
     mode: { allocatedWidth, allocatedHeight: 600, trackContainerResize() {} },
     factory: { requestRender() {} },
-    webAPI: {}
+    webAPI: {},
+    ...(offsetMinutes === undefined ? {} : { userSettings: { getTimeZoneOffsetMinutes: () => offsetMinutes } }),
+    ...(utils ? { utils } : {})
   };
 }
 

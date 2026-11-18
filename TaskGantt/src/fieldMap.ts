@@ -1,13 +1,25 @@
+import { DateBehavior, toUserCalendarDate } from "./deadline";
+
 export type FieldKey = "title" | "start" | "finish" | "owner" | "status" | "createdOn" | "description" | "parent" | "milestone" | "sequence" | "summary";
 export type ColumnLike = { name:string; alias?:string; dataType?:string; displayName?:string };
 export type RecordLike = { getValue(columnName:string):unknown; getFormattedValue(columnName:string):string };
 // Parent reference read from the mapped lookup. name is only set when Dataverse returned display text for it.
 export type ParentRef = { id:string; entityType?:string; name?:string };
+// Neutral: completion semantics are not known for the mapping, so no completed, overdue or due-soon styling is applied.
+export type TaskStatus = "Active" | "Completed" | "Canceled" | "Neutral";
+// Completion comes only from raw values with a known meaning; labels are never interpreted. The standard Task statecode
+// is built in; every other mapping uses the configured Status values or a configured progress column.
+export type Completion =
+  | { kind:"status"; source:"task"|"configured"; column:ColumnLike; completed:string[]; canceled:string[]; open?:string[] }
+  | { kind:"progress"; column:ColumnLike; completeAt:number };
+export type CompletionConfig = { completedValues?:string|null; canceledValues?:string|null; progressColumn?:string|null; progressCompleteValue?:number|null };
+// How each mapped date column is read: its Dataverse behavior and the user's time zone offset for an instant.
+export type DateReading = { behaviorOf?:(column:ColumnLike)=>DateBehavior; offsetFor?:(instant:Date)=>number };
 export type TaskItem = {
   recordId:string;
   name:string;
   assignedTo:string;
-  status:"Active"|"Completed";
+  status:TaskStatus;
   statusLabel?:string;
   description?:string;
   start:Date|null;
@@ -22,7 +34,9 @@ export type FieldMap = {
   isTaskTable:boolean;
   isProjectTaskTable?:boolean;
   columns:Partial<Record<FieldKey,ColumnLike>>;
-  completedRawValue?:string;
+  completion?:Completion;
+  // Set when the completion settings are invalid; rows are then Neutral and the reason is shown.
+  completionError?:string;
   // Project Operations hierarchy columns that are not in the view, so the hierarchy features they drive stay off.
   missingViewColumns?:string[];
 };
@@ -46,6 +60,9 @@ export type GanttLayout = {
   showStatusFilter:boolean;
   showCreatedOnFilter:boolean;
   showDescription:boolean;
+  // Deadline colours and the colour legend need known completion semantics.
+  showDeadlines?:boolean;
+  showCanceled?:boolean;
   notice?:string;
 };
 
@@ -68,7 +85,9 @@ export const PROPERTY_SET_NAMES: Partial<Record<FieldKey,string>> = {
 
 const TASK_ENTITY = "task";
 const PROJECT_TASK_ENTITY = "msdyn_projecttask";
-const TASK_STATECODE_COMPLETED = "1";
+// Task statecode: Open (0), Completed (1), Canceled (2), verified in sandbox-simetrix metadata (2026-11-18).
+const TASK_STATECODE = { completed: ["1"], canceled: ["2"], open: ["0"] };
+const NUMERIC_TYPES = ["whole.none", "decimal", "fp", "currency"];
 
 // Column names used for the standard Task table when a property-set is not bound. Description is
 // intentionally absent so existing Tasks configurations only show it after it is explicitly bound.
@@ -119,7 +138,9 @@ export const TASK_LAYOUT: GanttLayout = {
   showStatus: true,
   showStatusFilter: true,
   showCreatedOnFilter: true,
-  showDescription: false
+  showDescription: false,
+  showDeadlines: true,
+  showCanceled: true
 };
 
 const normalizeEntity = (entityType?:string|null) => (entityType ?? "").trim().toLowerCase();
@@ -147,7 +168,39 @@ export function resolveColumn(columns:ColumnLike[], key:FieldKey, defaults:Parti
   return defaultName ? columns.find(column => column.name === defaultName) : undefined;
 }
 
-export function resolveFieldMap(columns:ColumnLike[], entityType?:string|null):FieldMap {
+// Comma or semicolon separated raw choice values, for example "1" or "192350001; 192350002". undefined when invalid.
+export function parseRawValues(text:string|null|undefined):string[]|undefined {
+  const parts = (text ?? "").split(/[,;]/).map(part => part.trim()).filter(Boolean);
+  if (!parts.length) return [];
+  return parts.every(part => /^-?\d+$/.test(part)) ? Array.from(new Set(parts.map(part => String(Number(part))))) : undefined;
+}
+
+// Explicit settings win: a progress column, then configured Status values, then the built-in Task statecode.
+export function resolveCompletion(columns:Partial<Record<FieldKey,ColumnLike>>, allColumns:ColumnLike[], isTaskTable:boolean, config:CompletionConfig = {}):{ completion?:Completion; error?:string } {
+  const progressName = (config.progressColumn ?? "").trim().toLowerCase();
+  if (progressName) {
+    const column = allColumns.find(candidate => candidate.name.toLowerCase() === progressName);
+    if (!column) return { error: `Deadline colours are off: the progress column ${progressName} is not in this view.` };
+    if (!NUMERIC_TYPES.includes((column.dataType ?? "").toLowerCase())) return { error: `Deadline colours are off: ${column.displayName || progressName} is not a number column.` };
+    const completeAt = config.progressCompleteValue === null || config.progressCompleteValue === undefined ? 100 : Number(config.progressCompleteValue);
+    if (!Number.isFinite(completeAt) || completeAt <= 0) return { error: "Deadline colours are off: the Completed progress value must be greater than 0." };
+    return { completion: { kind: "progress", column, completeAt } };
+  }
+  const completed = parseRawValues(config.completedValues);
+  const canceled = parseRawValues(config.canceledValues);
+  if (!completed || !canceled) return { error: "Deadline colours are off: Completed and Canceled status values must be whole numbers separated by commas." };
+  if (completed.length || canceled.length) {
+    if (!columns.status) return { error: "Deadline colours are off: status values are configured but no Status column is mapped." };
+    if (!completed.length) return { error: "Deadline colours are off: set the Completed status values as well as the Canceled ones." };
+    const overlap = completed.filter(value => canceled.includes(value));
+    if (overlap.length) return { error: `Deadline colours are off: ${overlap.join(", ")} is configured as both Completed and Canceled.` };
+    return { completion: { kind: "status", source: "configured", column: columns.status, completed, canceled } };
+  }
+  if (isTaskTable && columns.status?.name === "statecode") return { completion: { kind: "status", source: "task", column: columns.status, ...TASK_STATECODE } };
+  return {};
+}
+
+export function resolveFieldMap(columns:ColumnLike[], entityType?:string|null, config?:CompletionConfig):FieldMap {
   const isTaskTable = isStandardTaskTable(entityType);
   const isProjectTask = isProjectTaskTable(entityType);
   const defaults = tableDefaults(entityType);
@@ -156,10 +209,12 @@ export function resolveFieldMap(columns:ColumnLike[], entityType?:string|null):F
     const column = resolveColumn(columns, key, defaults);
     if (column) resolved[key] = column;
   });
+  const { completion, error } = resolveCompletion(resolved, columns, isTaskTable, config);
   const map:FieldMap = {
     isTaskTable,
     columns: resolved,
-    completedRawValue: isTaskTable && resolved.status?.name === "statecode" ? TASK_STATECODE_COMPLETED : undefined
+    ...(completion ? { completion } : {}),
+    ...(error ? { completionError: error } : {})
   };
   if (isProjectTask) {
     map.isProjectTaskTable = true;
@@ -184,23 +239,9 @@ export function hasDate(value:Date|null|undefined):value is Date {
 
 // Returns null for empty values. Date Only values become local midnight of their calendar day, whether the
 // platform supplies them as "yyyy-mm-dd" strings, UTC midnight or local midnight, so they never shift a day.
+// Date and Time values become the calendar day in the browser's zone; mapRecord uses the user's Dynamics zone instead.
 export function toCalendarDate(raw:unknown, dateOnly:boolean):Date|null {
-  if (raw === null || raw === undefined || raw === "") return null;
-  if (dateOnly && typeof raw === "string") {
-    const match = /^(\d{4})-(\d{2})-(\d{2})/.exec(raw);
-    if (match) return new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
-  }
-  const date = raw instanceof Date ? new Date(raw.getTime()) : new Date(raw as string | number);
-  if (!hasDate(date)) return null;
-  if (!dateOnly) return date;
-  const isUtcMidnight = date.getUTCHours() === 0 && date.getUTCMinutes() === 0 && date.getUTCSeconds() === 0 && date.getUTCMilliseconds() === 0;
-  return isUtcMidnight
-    ? new Date(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate())
-    : new Date(date.getFullYear(), date.getMonth(), date.getDate());
-}
-
-export function isCompletedLabel(label:string):boolean {
-  return label.trim().toLowerCase() === "completed";
+  return toUserCalendarDate(raw, dateOnly ? "dateOnly" : "userLocal");
 }
 
 export function normalizeId(id:string):string {
@@ -244,25 +285,45 @@ export function toSequence(raw:unknown):number|null {
   return Number.isFinite(number) ? number : null;
 }
 
-export function mapRecord(recordId:string, record:RecordLike, map:FieldMap, completedRawValue?:string):TaskItem {
-  const { columns, isTaskTable } = map;
+// Status comes only from known raw values. Without them the mapped status is displayed as returned and the row is Neutral.
+// With status values, every other value of the column is open (Active); with a progress column, any value below the
+// Completed value is Active. An empty value is never interpreted.
+export function statusOf(raw:unknown, completion?:Completion):TaskStatus {
+  if (!completion || raw === null || raw === undefined || raw === "") return "Neutral";
+  if (completion.kind === "progress") {
+    const progress = typeof raw === "number" ? raw : Number(raw);
+    return !Number.isFinite(progress) ? "Neutral" : progress >= completion.completeAt ? "Completed" : "Active";
+  }
+  if (typeof raw !== "number" && typeof raw !== "string") return "Neutral";
+  const value = String(raw).trim();
+  if (completion.completed.includes(value)) return "Completed";
+  if (completion.canceled.includes(value)) return "Canceled";
+  // A built-in mapping lists its open values; configured values make every other option open.
+  return (completion.open ? completion.open.includes(value) : /^-?\d+$/.test(value)) ? "Active" : "Neutral";
+}
+
+export function dateBehaviorOf(column:ColumnLike):DateBehavior {
+  return isDateOnlyColumn(column) ? "dateOnly" : "userLocal";
+}
+
+export function mapRecord(recordId:string, record:RecordLike, map:FieldMap, reading:DateReading = {}):TaskItem {
+  const { columns, isTaskTable, completion } = map;
   const value = (column?:ColumnLike) => column ? record.getValue(column.name) : null;
   const formatted = (column?:ColumnLike) => column ? record.getFormattedValue(column.name) || "" : "";
-  const date = (column?:ColumnLike) => toCalendarDate(value(column), isDateOnlyColumn(column));
+  const behaviorOf = reading.behaviorOf ?? dateBehaviorOf;
+  // Every date is the calendar day in the user's Dynamics time zone, so bars, colours and filters agree.
+  const date = (column?:ColumnLike) => column ? toUserCalendarDate(value(column), isDateOnlyColumn(column) ? "dateOnly" : behaviorOf(column), reading.offsetFor) : null;
 
+  // The status text is always Dataverse's own (localized) label; only the raw value decides the state.
   const statusLabel = formatted(columns.status);
-  const rawStatus = value(columns.status);
-  const completed = completedRawValue !== undefined && rawStatus !== null && rawStatus !== undefined
-    ? String(rawStatus) === completedRawValue
-    : isCompletedLabel(statusLabel);
-  const status:TaskItem["status"] = completed ? "Completed" : "Active";
+  const status = statusOf(value(completion?.column ?? columns.status), completion);
 
   const item:TaskItem = {
     recordId,
     name: formatted(columns.title) || (isTaskTable ? "(Unnamed task)" : "(No title)"),
     assignedTo: columns.owner ? formatted(columns.owner) || "Unassigned" : "",
     status,
-    statusLabel: isTaskTable ? status : statusLabel || status,
+    statusLabel,
     description: formatted(columns.description),
     start: date(columns.start) ?? (isTaskTable ? date(columns.createdOn) : null),
     due: date(columns.finish)
@@ -279,22 +340,25 @@ export function buildLayout(map:FieldMap):GanttLayout {
   const visibility = {
     showOwner: Boolean(columns.owner),
     showStatus: Boolean(columns.status),
-    // Custom tables have no known Completed value until one can be configured explicitly, so the status
-    // column is shown but the completion filter is deferred.
-    showStatusFilter: Boolean(columns.status) && map.isTaskTable,
+    // The completion filter and deadline colours need known raw values (Task statecode or the completion settings).
+    // Other mappings show their status column; metadata-based filtering by status stays available through Filter by.
+    showStatusFilter: Boolean(map.completion),
+    showDeadlines: Boolean(map.completion),
+    showCanceled: map.completion?.kind === "status" && map.completion.canceled.length > 0,
     showCreatedOnFilter: Boolean(columns.createdOn),
     showDescription: Boolean(columns.description)
   };
-  if (map.isTaskTable) return { ...TASK_LAYOUT, ...visibility };
+  if (map.isTaskTable) return { ...TASK_LAYOUT, ...visibility, ...(map.completionError ? { notice: map.completionError } : {}) };
 
   const label = (column:ColumnLike|undefined, fallback:string) => column?.displayName?.trim() || fallback;
   const title = label(columns.title, "Title");
   const start = label(columns.start, "Start");
   const finish = label(columns.finish, "Finish");
   const missing = map.missingViewColumns ?? [];
-  const notice = missing.length
-    ? `Add ${missing.join(", ")} to the view to show the Project Operations hierarchy, summary bars and milestones.`
-    : undefined;
+  const notice = [
+    missing.length ? `Add ${missing.join(", ")} to the view to show the Project Operations hierarchy, summary bars and milestones.` : "",
+    map.completionError ?? ""
+  ].filter(Boolean).join(" ") || undefined;
   return {
     title: map.isProjectTaskTable ? "Project Tasks" : "Schedule",
     itemsLabel: map.isProjectTaskTable ? "tasks" : "records",

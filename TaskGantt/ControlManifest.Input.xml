@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8" ?>
 <manifest>
-  <control namespace="Voss" constructor="TaskGantt" version="3.5.0" display-name-key="Task Gantt" description-key="Responsive Gantt view for Dataverse tasks" control-type="virtual">
+  <control namespace="Voss" constructor="TaskGantt" version="3.7.1" display-name-key="Task Gantt" description-key="Responsive Gantt view for Dataverse tasks" control-type="virtual">
     <external-service-usage enabled="true">
       <domain>modern365timeline-license-fkh6gbgdhnchgyhj.westeurope-01.azurewebsites.net</domain>
     </external-service-usage>
@@ -40,6 +40,16 @@
     <property name="dependencyTable" display-name-key="Dependency table (optional)" description-key="Logical name of a custom link table. Links are drawn Finish-to-Start." of-type="SingleLine.Text" usage="input" required="false" />
     <property name="dependencyPredecessorColumn" display-name-key="Predecessor column (optional)" description-key="Logical name of the lookup column on the link table that points to the predecessor row." of-type="SingleLine.Text" usage="input" required="false" />
     <property name="dependencySuccessorColumn" display-name-key="Successor column (optional)" description-key="Logical name of the lookup column on the link table that points to the successor row." of-type="SingleLine.Text" usage="input" required="false" />
+    <!-- Search box (Contains) over one text column of the table; every page is searched on the server. -->
+    <property name="searchColumn" display-name-key="Search column (optional)" description-key="Logical name of a text column. Shows a search box that finds records whose value contains the entered text." of-type="SingleLine.Text" usage="input" required="false" />
+    <!-- Completion and deadline colours (3.7.0). Completion comes only from raw values; labels are never interpreted. -->
+    <property name="completedStatusValues" display-name-key="Completed status values (optional)" description-key="Raw values of the mapped Status column that mean Completed, separated by commas, for example 1 or 192350001. Other values are open. Tasks bound to Status use 1 automatically." of-type="SingleLine.Text" usage="input" required="false" />
+    <property name="canceledStatusValues" display-name-key="Canceled status values (optional)" description-key="Raw values of the mapped Status column that mean Canceled, separated by commas. Canceled rows are grey and never overdue. Tasks bound to Status use 2 automatically." of-type="SingleLine.Text" usage="input" required="false" />
+    <property name="progressColumn" display-name-key="Progress column (optional)" description-key="Logical name of a number column in the view, for example a percent complete column. A row is Completed when its value reaches the Completed progress value. Takes precedence over status values." of-type="SingleLine.Text" usage="input" required="false" />
+    <property name="progressCompleteValue" display-name-key="Completed progress value (optional)" description-key="Progress value at which a row is Completed. Default 100." of-type="Whole.None" usage="input" required="false" />
+    <property name="dueSoonDays" display-name-key="Yellow from (days before Finish)" description-key="Open rows turn yellow this many days before Finish. Default 2." of-type="Whole.None" usage="input" required="false" />
+    <property name="dueNearDays" display-name-key="Orange from (days before Finish)" description-key="Open rows turn orange this many days before Finish. Default 1." of-type="Whole.None" usage="input" required="false" />
+    <property name="dueImminentDays" display-name-key="Dark orange from (days before Finish)" description-key="Open rows turn dark orange this many days before Finish. Default 0, the due day. Rows turn red the day after Finish." of-type="Whole.None" usage="input" required="false" />
     <resources>
       <code path="index.ts" order="1" />
       <platform-library name="React" version="16.14.0" />

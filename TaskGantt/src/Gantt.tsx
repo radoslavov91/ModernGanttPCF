@@ -3,6 +3,8 @@ import { GanttLayout, hasDate, normalizeId, TASK_LAYOUT, TaskItem } from "./fiel
 import { Hierarchy, SummarySpan, VisibleRow, visibleRows } from "./hierarchy";
 import { describeSkipped, layoutDependencies, representatives, routePath, RowAnchor, stubPath } from "./dependencies";
 import type { DependencyView } from "./dependencyLoader";
+import { deadlineState, deadlineText, DEFAULT_THRESHOLDS, DeadlineState, DeadlineThresholds } from "./deadline";
+import { describeFilter, EMPTY_CRITERIA, FILTER_OPERATORS, FilterColumn, FilterOperator, GanttCriteria, hasCriteria, isDateValue, MatchingTotal, recordCountText, SearchState } from "./viewCriteria";
 
 export type { GanttLayout, TaskItem } from "./fieldMap";
 export type StatusFilter = "all" | "active" | "completed" | "overdue";
@@ -35,7 +37,7 @@ export type LicenseDebugInfo = {
     durationMs?:number;
   };
 };
-export const CONTROL_VERSION = "3.5.0";
+export const CONTROL_VERSION = "3.7.1";
 
 export type TaskFilters = {
   status: StatusFilter;
@@ -45,6 +47,9 @@ export type TaskFilters = {
 
 type Props = {
   tasks:TaskItem[];
+  // The user's current calendar day in the Dynamics time zone (local midnight); the browser's day when absent.
+  today?:Date;
+  thresholds?:DeadlineThresholds;
   // Present only when a Parent column is mapped; without it the rows render flat exactly as before.
   hierarchy?:Hierarchy;
   // Present only when a link source applies (Project Operations or a configured link table).
@@ -55,6 +60,17 @@ type Props = {
   allocatedWidth:number;
   loading:boolean;
   filters:TaskFilters;
+  // Search and column filters; absent in hosts or tests that do not offer them.
+  criteria?:GanttCriteria;
+  filterColumns?:FilterColumn[];
+  search?:SearchState;
+  // Mapped field keys (title, start, finish, ...) whose column is filtered, for header indicators.
+  filteredFields?:string[];
+  criteriaNotice?:string;
+  // Dataset records only; updating is set while a request runs and the previous count is shown.
+  recordCount?:{ loaded:number; total:MatchingTotal; updating:boolean };
+  onCriteriaChange?:(criteria:GanttCriteria)=>void;
+  onClearAll?:()=>void;
   sorting:SortState;
   licenseState:LicenseState;
   licenseMessage:string;
@@ -70,13 +86,13 @@ type Props = {
   instanceId:string;
 };
 
-export type TaskUrgency = "completed" | "overdue" | "dueSoon" | "normal";
+// Bar and diamond colour class: deadline level for Active rows, otherwise the known state or neutral.
+export type BarTone = "scheduled" | "approaching" | "near" | "imminent" | "overdue" | "completed" | "canceled" | "neutral";
 const DAY = 86400000;
 const clamp = (value:number,min:number,max:number) => Math.min(max,Math.max(min,value));
 const startOfDay = (d:Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate());
 const addDays = (d:Date,n:number) => new Date(d.getFullYear(),d.getMonth(),d.getDate()+n);
 const fmt = (d:Date) => d.toLocaleDateString(undefined,{day:"2-digit",month:"short",year:"numeric"});
-const bodyOverlayIds = new Set<string>();
 
 export function sortTasksForDisplay(tasks:TaskItem[], sorting:SortState):TaskItem[] {
   if (!sorting) return tasks;
@@ -114,27 +130,23 @@ function normalizeText(value:string):string|null {
   return normalized ? normalized : null;
 }
 
-export function cleanupTaskGanttOverlays(instanceId?:string):void {
+// Every layer now lives inside the control's own element. This only removes a version note that 3.7.0 and earlier
+// attached to document.body, in case one is left on the page when the control is destroyed.
+export function cleanupTaskGanttOverlays(instanceId:string):void {
   if (typeof document === "undefined") return;
-  const ids = instanceId ? [`tg-info-overlay-${instanceId}`] : Array.from(bodyOverlayIds);
-  ids.forEach(id=>{
-    document.getElementById(id)?.remove();
-    bodyOverlayIds.delete(id);
-  });
+  const legacy = document.getElementById(`tg-info-overlay-${instanceId}`);
+  if (legacy?.parentElement === document.body) legacy.remove();
 }
 
-export const getTaskUrgency = (task:TaskItem, now:Date = new Date()):TaskUrgency => {
-  if (task.status === "Completed") return "completed";
-  if (!hasDate(task.due)) return "normal";
-  const dueDay = startOfDay(task.due).getTime();
-  const today = startOfDay(now);
-  const todayTime = today.getTime();
-  if (dueDay < todayTime) return "overdue";
-  if (dueDay <= addDays(today,2).getTime()) return "dueSoon";
-  return "normal";
-};
+// The single deadline calculation for a row (colours, icon, tooltips); the server-side overdue filter uses the same day rule.
+export function rowDeadline(task:TaskItem, today:Date, thresholds:DeadlineThresholds = DEFAULT_THRESHOLDS):DeadlineState|undefined {
+  return deadlineState(task.status, task.due, today, thresholds);
+}
 
-const urgencyText = (urgency:TaskUrgency,due:Date) => urgency === "overdue" ? `Overdue \u2014 due ${fmt(due)}` : urgency === "dueSoon" ? `Due soon \u2014 due ${fmt(due)}` : "";
+export function barTone(task:TaskItem, deadline:DeadlineState|undefined):BarTone {
+  if (deadline) return deadline.level;
+  return task.status === "Completed" ? "completed" : task.status === "Canceled" ? "canceled" : task.status === "Active" ? "scheduled" : "neutral";
+}
 
 const fmtOptional = (d:Date|null) => hasDate(d) ? fmt(d) : "\u2014";
 
@@ -155,18 +167,46 @@ export function summaryTitle(name:string, span:SummarySpan):string {
   return `${name}: ${range} (from ${children}; may be incomplete)`;
 }
 
-const UrgencyIndicator: React.FC<{urgency:TaskUrgency;due:Date|null}> = ({urgency,due}) => {
-  if ((urgency !== "overdue" && urgency !== "dueSoon") || !hasDate(due)) return null;
-  const label = urgencyText(urgency,due);
-  return <span className={`tg-urgency ${urgency}`} role="img" aria-label={label} title={label}>
-    {urgency === "overdue"
-      ? <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><circle cx="8" cy="8" r="7"/><path d="M8 3.8v5.4M8 11.8h.01"/></svg>
-      : <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 1.8 15 14H1L8 1.8Z"/><path d="M8 5.6v4.2M8 12.1h.01"/></svg>}
+type TipHandlers = { show:(target:HTMLElement,text:string)=>void; hide:()=>void };
+
+// Overdue tasks only. Focusable so keyboard users get the same "Overdue by N days" tooltip as hover; the text is also
+// the accessible name.
+const OverdueIndicator: React.FC<{deadline:DeadlineState|undefined;tip:TipHandlers}> = ({deadline,tip}) => {
+  if (deadline?.level !== "overdue") return null;
+  const label = deadlineText(deadline);
+  return <span className="tg-urgency overdue" role="img" tabIndex={0} aria-label={label}
+    onMouseEnter={event=>tip.show(event.currentTarget,label)} onMouseLeave={tip.hide}
+    onFocus={event=>tip.show(event.currentTarget,label)} onBlur={tip.hide}>
+    <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><circle cx="8" cy="8" r="7"/><path d="M8 3.8v5.4M8 11.8h.01"/></svg>
   </span>;
 };
 
-export const Gantt: React.FC<Props> = ({tasks,hierarchy,dependencies,pageSize = 10,layout = TASK_LAYOUT,allocatedHeight,allocatedWidth,loading,filters,sorting,licenseState,licenseMessage,onRevalidateLicense,onFiltersChange,onSortChange,onRefresh,onOpen,onLoadMore,refreshDisabled,refreshing,instanceId}) => {
+type FilterEditor = { column:string; operator:FilterOperator; value:string; error?:string };
+
+export const Gantt: React.FC<Props> = ({tasks,today:todayProp,thresholds = DEFAULT_THRESHOLDS,hierarchy,dependencies,pageSize = 10,layout = TASK_LAYOUT,allocatedHeight,allocatedWidth,loading,filters,criteria = EMPTY_CRITERIA,filterColumns = [],search,filteredFields = [],criteriaNotice,recordCount,onCriteriaChange,onClearAll,sorting,licenseState,licenseMessage,onRevalidateLicense,onFiltersChange,onSortChange,onRefresh,onOpen,onLoadMore,refreshDisabled,refreshing,instanceId}) => {
+  const rootRef = React.useRef<HTMLElement>(null);
   const scrollRef = React.useRef<HTMLDivElement>(null);
+  const filterButtonRef = React.useRef<HTMLButtonElement>(null);
+  const popoverRef = React.useRef<HTMLDivElement>(null);
+  // One tooltip for the control, positioned inside it, for hover and keyboard focus. It follows its icon while the rows
+  // scroll (focus scrolls the icon into view) and is hidden while the icon is outside the visible rows.
+  const [tip,setTip] = React.useState<{text:string;left:number;top:number}|undefined>(undefined);
+  const tipTarget = React.useRef<{element:HTMLElement;text:string}|null>(null);
+  const placeTip = () => {
+    const root = rootRef.current, scroll = scrollRef.current, target = tipTarget.current;
+    if (!root || !scroll || !target) return;
+    const rect = target.element.getBoundingClientRect();
+    const rootRect = root.getBoundingClientRect();
+    const head = scroll.querySelector(".tg-head")?.getBoundingClientRect();
+    const scrollRect = scroll.getBoundingClientRect();
+    if (rect.top < (head ? head.bottom : scrollRect.top) - 1 || rect.bottom > scrollRect.bottom + 1) { setTip(undefined); return; }
+    const below = rect.bottom - rootRect.top + 6;
+    setTip({text:target.text, left:clamp(rect.left - rootRect.left + rect.width/2, 70, Math.max(70, rootRect.width - 70)), top: below + 30 > rootRect.height ? rect.top - rootRect.top - 30 : below});
+  };
+  const tipHandlers:TipHandlers = {
+    show: (element,text) => { tipTarget.current = {element,text}; placeTip(); },
+    hide: () => { tipTarget.current = null; setTip(undefined); }
+  };
   const todayRef = React.useRef<HTMLElement>(null);
   const infoButtonRef = React.useRef<HTMLButtonElement>(null);
   const positionedSignatures = React.useRef<Record<string,string>>({});
@@ -193,6 +233,48 @@ export const Gantt: React.FC<Props> = ({tasks,hierarchy,dependencies,pageSize = 
     scrollRef.current?.scrollTo({top:0,left:0,behavior:"auto"});
     onFiltersChange(nextFilters);
   };
+  // Search and column filters run on the server; the draft and the open editor are local until applied.
+  const [searchDraft,setSearchDraft] = React.useState(criteria.search);
+  React.useEffect(() => setSearchDraft(criteria.search), [criteria.search]);
+  const [editor,setEditor] = React.useState<FilterEditor|undefined>(undefined);
+  const editorOpen = Boolean(editor);
+  React.useEffect(() => {
+    if (!editorOpen || typeof document === "undefined") return undefined;
+    popoverRef.current?.querySelector<HTMLElement>("select, input")?.focus();
+    const close = (restoreFocus:boolean) => { setEditor(undefined); if (restoreFocus) filterButtonRef.current?.focus(); };
+    const onPointer = (event:PointerEvent) => {
+      const target = event.target as Node | null;
+      if (target && (popoverRef.current?.contains(target) || filterButtonRef.current?.contains(target))) return;
+      close(false);
+    };
+    const onKey = (event:KeyboardEvent) => { if (event.key === "Escape") { event.stopPropagation(); close(true); } };
+    document.addEventListener("pointerdown", onPointer, true);
+    document.addEventListener("keydown", onKey, true);
+    return () => { document.removeEventListener("pointerdown", onPointer, true); document.removeEventListener("keydown", onKey, true); };
+  }, [editorOpen]);
+  const changeCriteria = (next:GanttCriteria) => {
+    if (!onCriteriaChange) return;
+    scrollRef.current?.scrollTo({top:0,left:0,behavior:"auto"});
+    setEditor(undefined);
+    onCriteriaChange(next);
+  };
+  const columnLabel = (name:string) => filterColumns.find(column => column.name === name)?.label ?? name;
+  const openEditor = (name:string) => {
+    const column = filterColumns.find(candidate => candidate.name === name);
+    if (!column) return;
+    const active = criteria.filters.find(filter => filter.column === name);
+    setEditor({ column: name, operator: active?.operator ?? FILTER_OPERATORS[column.kind][0].value, value: active?.value ?? "" });
+  };
+  const applyEditor = () => {
+    const column = editor && filterColumns.find(candidate => candidate.name === editor.column);
+    if (!editor || !column) return;
+    const value = editor.value.trim();
+    const error = !value ? (column.kind === "text" ? "Enter a value." : column.kind === "date" ? "Select a date." : "Select a value.")
+      : column.kind === "date" && !isDateValue(value) ? "Enter a valid date." : undefined;
+    if (error) { setEditor({ ...editor, error }); return; }
+    const label = column.kind === "choice" ? column.options?.find(option => option.value === value)?.label : undefined;
+    changeCriteria({ search: criteria.search, filters: [...criteria.filters.filter(filter => filter.column !== column.name), { column: column.name, kind: column.kind, operator: editor.operator, value, ...(label ? { label } : {}) }] });
+  };
   const changeSort = (key:SortKey) => {
     const direction:SortDirection = sorting?.key === key && sorting.direction === "asc" ? "desc" : "asc";
     scrollRef.current?.scrollTo({top:scrollRef.current.scrollTop,left:0,behavior:"auto"});
@@ -205,7 +287,7 @@ export const Gantt: React.FC<Props> = ({tasks,hierarchy,dependencies,pageSize = 
     ...allRows.flatMap(row => row.summary ? [row.summary.start.getTime(), row.summary.end.getTime()] : []),
     ...tasks.map(milestoneDate).filter(hasDate).map(d => d.getTime())
   ];
-  const today = startOfDay(new Date());
+  const today = startOfDay(todayProp ?? new Date());
   const min = startOfDay(new Date(Math.min(today.getTime(),...datedTasks.map(t=>t.start.getTime()),...extraTimes)));
   const max = startOfDay(new Date(Math.max(today.getTime(),...datedTasks.map(t=>Math.max(t.start.getTime(),t.due.getTime())),...extraTimes)));
   const timelineStart = addDays(min,-1), timelineEnd = addDays(max,1);
@@ -220,7 +302,7 @@ export const Gantt: React.FC<Props> = ({tasks,hierarchy,dependencies,pageSize = 
   const showDescriptionColumn = !compactMode && layout.showDescription;
   const assignedToWidth = showAssignedColumn ? 170 : 0;
   const descriptionWidth = showDescriptionColumn ? 220 : 0;
-  const statusWidth = !layout.showStatus ? 0 : compactMode ? (compactFallback ? 82 : 90) : 105;
+  const statusWidth = !layout.showStatus ? 0 : compactMode ? (compactFallback ? 82 : 90) : 125;
   const startDateWidth = compactMode ? 0 : 115;
   const dueDateWidth = compactMode ? (compactFallback ? 130 : 145) : 115;
   const dayWidth = compactMode ? (compactFallback ? 32 : allocatedWidthNumber < 900 ? 34 : 36) : allocatedWidthNumber < 700 ? 28 : allocatedWidthNumber < 1100 ? 32 : 38;
@@ -249,78 +331,59 @@ export const Gantt: React.FC<Props> = ({tasks,hierarchy,dependencies,pageSize = 
     "--tg-start-date-left": `${taskNameWidth + assignedToWidth + descriptionWidth + statusWidth}px`,
     "--tg-due-date-left": `${taskNameWidth + assignedToWidth + descriptionWidth + statusWidth + startDateWidth}px`
   } as React.CSSProperties;
-  const hasActiveFilters = filters.status !== "all" || filters.createdOn !== "all" || filters.dueDate !== "all";
-  const now = new Date();
+  const hasToolbarFilters = filters.status !== "all" || filters.createdOn !== "all" || filters.dueDate !== "all";
+  const hasSearchOrFilters = hasCriteria(criteria);
+  const hasActiveFilters = hasToolbarFilters || hasSearchOrFilters;
   const sortSignature = sorting ? `${sorting.key}:${sorting.direction}` : "default";
-  const filterSignature = `${filters.status}|${filters.createdOn}|${filters.dueDate}|${sortSignature}`;
+  const criteriaSignature = hasSearchOrFilters ? `|${JSON.stringify([criteria.search, criteria.filters.map(filter => [filter.column, filter.operator, filter.value])])}` : "";
+  const filterSignature = `${filters.status}|${filters.createdOn}|${filters.dueDate}|${sortSignature}${criteriaSignature}`;
   const layoutMode = compactMode ? "compact" : "detailed";
   const timelineSignature = `${layoutMode}|${timelineStart.getTime()}|${numberOfDays}|${dayWidth}`;
 
+  // The version note is rendered inside the control (3.7.1; 3.7.0 attached it to document.body above every Dynamics
+  // dialog). Outside pointer and Escape close it; the listeners exist only while it is open and go with the control.
   React.useEffect(() => {
-    if (!infoOpen || typeof document === "undefined") {
-      cleanupTaskGanttOverlays(instanceId);
-      return undefined;
-    }
-
+    if (!infoOpen || typeof document === "undefined") return undefined;
     const button = infoButtonRef.current;
-    if (!button) return undefined;
-
-    const overlay = document.createElement("div");
-    overlay.id = overlayId;
-    overlay.className = "tg-info-overlay";
-    overlay.setAttribute("role", "tooltip");
-    overlay.textContent = `Task Gantt PCF version ${CONTROL_VERSION}`;
-    document.body.appendChild(overlay);
-    bodyOverlayIds.add(overlayId);
-
-    let frame = 0;
-    const positionOverlay = () => {
-      window.cancelAnimationFrame(frame);
-      frame = window.requestAnimationFrame(() => {
-        const rect = button.getBoundingClientRect();
-        const overlayRect = overlay.getBoundingClientRect();
-        const gap = 8;
-        const viewportPadding = 8;
-        const overlayWidth = overlayRect.width || 240;
-        const overlayHeight = overlayRect.height || 32;
-        const roomBelow = window.innerHeight - rect.bottom;
-        const top = roomBelow >= overlayHeight + gap + viewportPadding
-          ? rect.bottom + gap
-          : Math.max(viewportPadding, rect.top - overlayHeight - gap);
-        const preferredLeft = rect.left + (rect.width / 2) - (overlayWidth / 2);
-        const left = clamp(preferredLeft, viewportPadding, Math.max(viewportPadding, window.innerWidth - overlayWidth - viewportPadding));
-        overlay.style.top = `${top}px`;
-        overlay.style.left = `${left}px`;
-      });
-    };
-
     const closeIfOutside = (event:PointerEvent) => {
       const target = event.target as Node | null;
-      if (target && (button.contains(target) || overlay.contains(target))) return;
+      if (target && (button?.contains(target) || document.getElementById(overlayId)?.contains(target))) return;
       setInfoOpen(false);
     };
     const closeOnEscape = (event:KeyboardEvent) => {
       if (event.key === "Escape") {
         setInfoOpen(false);
-        button.focus();
+        button?.focus();
       }
     };
-
-    positionOverlay();
     document.addEventListener("pointerdown", closeIfOutside, true);
     document.addEventListener("keydown", closeOnEscape, true);
-    window.addEventListener("resize", positionOverlay);
-    document.addEventListener("scroll", positionOverlay, true);
-
     return () => {
-      window.cancelAnimationFrame(frame);
       document.removeEventListener("pointerdown", closeIfOutside, true);
       document.removeEventListener("keydown", closeOnEscape, true);
-      window.removeEventListener("resize", positionOverlay);
-      document.removeEventListener("scroll", positionOverlay, true);
-      cleanupTaskGanttOverlays(instanceId);
     };
-  }, [infoOpen, instanceId, overlayId]);
+  }, [infoOpen, overlayId]);
+  const infoPosition = (() => {
+    const button = infoButtonRef.current, root = rootRef.current;
+    if (!infoOpen || !button || !root) return undefined;
+    const rect = button.getBoundingClientRect(), rootRect = root.getBoundingClientRect();
+    return { left: Math.max(8, rect.left - rootRect.left - 8), top: rect.bottom - rootRect.top + 8 };
+  })();
+
+  const centreToday = (behavior:ScrollBehavior) => {
+    const scroll = scrollRef.current;
+    const marker = todayRef.current;
+    if (!scroll || !marker) return;
+    const markerRect = marker.getBoundingClientRect();
+    const scrollRect = scroll.getBoundingClientRect();
+    const stickyCells = Array.from(scroll.querySelectorAll<HTMLElement>(".tg-head .tg-sticky"));
+    const measuredFrozenWidth = stickyCells.reduce((total,cell)=>total + cell.getBoundingClientRect().width,0);
+    const frozenWidth = Math.min(measuredFrozenWidth, Math.max(0, scroll.clientWidth - dayWidth));
+    const visibleTimelineWidth = Math.max(dayWidth, scroll.clientWidth - frozenWidth);
+    const markerCenter = markerRect.left - scrollRect.left + scroll.scrollLeft + (markerRect.width / 2);
+    const maxLeft = Math.max(0, scroll.scrollWidth - scroll.clientWidth);
+    scroll.scrollTo({left:clamp(markerCenter - frozenWidth - (visibleTimelineWidth / 2), 0, maxLeft),top:scroll.scrollTop,behavior});
+  };
 
   React.useLayoutEffect(() => {
     if (loading || todayIndex < 0 || todayIndex >= numberOfDays) return;
@@ -348,17 +411,7 @@ export const Gantt: React.FC<Props> = ({tasks,hierarchy,dependencies,pageSize = 
     }
 
     requestAnimationFrame(() => {
-      const markerRect = marker.getBoundingClientRect();
-      const scrollRect = scroll.getBoundingClientRect();
-      const currentTop = scroll.scrollTop;
-      const stickyCells = Array.from(scroll.querySelectorAll<HTMLElement>(".tg-head .tg-sticky"));
-      const measuredFrozenWidth = stickyCells.reduce((total,cell)=>total + cell.getBoundingClientRect().width,0);
-      const frozenWidth = Math.min(measuredFrozenWidth, Math.max(0, scroll.clientWidth - dayWidth));
-      const visibleTimelineWidth = Math.max(dayWidth, scroll.clientWidth - frozenWidth);
-      const markerCenter = markerRect.left - scrollRect.left + scroll.scrollLeft + (markerRect.width / 2);
-      const maxLeft = Math.max(0, scroll.scrollWidth - scroll.clientWidth);
-      const targetLeft = clamp(markerCenter - frozenWidth - (visibleTimelineWidth / 2), 0, maxLeft);
-      scroll.scrollTo({left:targetLeft,top:currentTop,behavior:"auto"});
+      centreToday("auto");
       positionedSignatures.current[filterSignature] = timelineSignature;
     });
   }, [filterSignature, loading, numberOfDays, timelineSignature, todayIndex]);
@@ -375,10 +428,14 @@ export const Gantt: React.FC<Props> = ({tasks,hierarchy,dependencies,pageSize = 
   }, [rowSignature, Boolean(dependencies), showDependencies, allocatedWidth]);
 
   const renderTimelineCells = () => dateCells.map((d,i)=><i key={i} className={d.getDay()%6===0?"weekend":""}/>);
+  const SORT_FIELDS:Record<SortKey,string> = {task:"title",assignedTo:"owner",startDate:"start",dueDate:"finish"};
+  const filterMark = (field:string) => filteredFields.includes(field)
+    ? <span className="tg-filter-mark" role="img" aria-label="Filtered" title="Filtered"><svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2 3h12l-4.6 5.4V13l-2.8 1.2V8.4Z"/></svg></span>
+    : null;
   const renderSortButton = (label:string,key:SortKey) => {
     const active = sorting?.key === key;
     return <button className="tg-sort" type="button" onClick={()=>changeSort(key)}>
-      <span>{label}</span>{active && <i aria-hidden="true">{sorting.direction === "asc" ? "\u25B2" : "\u25BC"}</i>}
+      <span>{label}</span>{active && <i aria-hidden="true">{sorting.direction === "asc" ? "\u25B2" : "\u25BC"}</i>}{filterMark(SORT_FIELDS[key])}
     </button>;
   };
   const renderSortHeader = (label:string,key:SortKey,className:string) => {
@@ -445,10 +502,13 @@ export const Gantt: React.FC<Props> = ({tasks,hierarchy,dependencies,pageSize = 
   ) : undefined;
   const plural = (n:number,word:string) => `${n} ${word}${n === 1 ? "" : "s"}`;
   const dependencyNote = !dependencies ? undefined
-    : dependencies.status === "error" ? {text:"Dependencies unavailable", title:`${dependencies.message ?? "The dependency rows could not be read."} Bars and dates are unaffected.`, error:true}
+    : dependencies.status === "error" ? {
+      text: dependencies.errorKind === "noProject" ? "Dependencies unavailable: no project" : dependencies.errorKind === "access" ? "Dependencies unavailable: no access" : "Dependencies unavailable",
+      title:`${dependencies.message ?? "The dependency rows could not be read."} Bars and dates are unaffected.`, error:true}
     : dependencies.status === "loading" ? {text:"Loading dependencies…", title:"Reading dependency rows for the loaded tasks.", error:false}
     : (() => {
       const parts:string[] = [], details:string[] = [];
+      if (dependencies.unscoped) { parts.push(`${plural(dependencies.unscoped,"task")} without a project`); details.push("Their links are not read because their Project value is empty."); }
       if (dependencyLayout?.notLoaded) { parts.push(`${plural(dependencyLayout.notLoaded,"link")} to rows not loaded`); details.push("One end is filtered out, on a later page or not accessible; Load more reconnects rows from later pages."); }
       if (dependencies.skipped.length) { parts.push(`${plural(dependencies.skipped.length,"link")} skipped`); details.push(`Skipped: ${describeSkipped(dependencies.skipped)}.`); }
       if (dependencyLayout?.unscheduled) { parts.push(`${plural(dependencyLayout.unscheduled,"link")} not drawn`); details.push("A linked task has no bar (missing or invalid dates)."); }
@@ -466,12 +526,68 @@ export const Gantt: React.FC<Props> = ({tasks,hierarchy,dependencies,pageSize = 
       {dependencyLayout.stubs.map(stub => <g key={stub.key} className="tg-dep-stub" role="img" aria-label={stub.title}><title>{stub.title}</title><path d={stubPath(stub.x,centerOf(stub.rowIndex),stub.side)}/><circle cx={stub.x + (stub.side === "end" ? 12 : -12)} cy={centerOf(stub.rowIndex)} r="3"/></g>)}
     </svg>}
   </div>;
-  return <section className={`tg ${compactMode ? "tg-compact" : "tg-detailed"}`} style={rootStyle} aria-label={layout.title === TASK_LAYOUT.title ? "Tasks Gantt" : `${layout.title} Gantt`}>
+  return <section ref={rootRef} className={`tg ${compactMode ? "tg-compact" : "tg-detailed"}`} style={rootStyle} aria-label={layout.title === TASK_LAYOUT.title ? "Tasks Gantt" : `${layout.title} Gantt`}>
     <header className="tg-toolbar">
-      <span className="tg-title"><strong>{layout.title}</strong><button ref={infoButtonRef} className="tg-info" type="button" aria-label={`Task Gantt PCF version ${CONTROL_VERSION}`} aria-expanded={infoOpen} aria-describedby={infoOpen ? overlayId : undefined} onClick={()=>setInfoOpen(open=>!open)}><span aria-hidden="true">i</span></button><button className={`tg-refresh ${refreshing ? "is-refreshing" : ""}`} type="button" title={`Refresh ${items}`} aria-label={`Refresh ${items}`} disabled={refreshDisabled} onClick={onRefresh}>
-        <svg viewBox="0 0 20 20" aria-hidden="true" focusable="false"><path d="M16.9 3.6v4.7h-4.7l1.8-1.8A5.5 5.5 0 0 0 4.5 10H3.2a6.8 6.8 0 0 1 11.7-4.4l2-2Zm-1.4 6.4h1.3A6.8 6.8 0 0 1 5.1 14.4l-2 2v-4.7h4.7L6 13.5a5.5 5.5 0 0 0 9.5-3.5Z"/></svg>
-      </button></span>
-      <span className="tg-filters">
+      <div className="tg-toolbar-row tg-toolbar-top">
+        <span className="tg-title"><strong>{layout.title}</strong><button ref={infoButtonRef} className="tg-info" type="button" aria-label={`Task Gantt PCF version ${CONTROL_VERSION}`} aria-expanded={infoOpen} aria-describedby={infoOpen ? overlayId : undefined} onClick={()=>setInfoOpen(open=>!open)}><span aria-hidden="true">i</span></button><button className={`tg-refresh ${refreshing ? "is-refreshing" : ""}`} type="button" title={`Refresh ${items}`} aria-label={`Refresh ${items}`} disabled={refreshDisabled} onClick={onRefresh}>
+          <svg viewBox="0 0 20 20" aria-hidden="true" focusable="false"><path d="M16.9 3.6v4.7h-4.7l1.8-1.8A5.5 5.5 0 0 0 4.5 10H3.2a6.8 6.8 0 0 1 11.7-4.4l2-2Zm-1.4 6.4h1.3A6.8 6.8 0 0 1 5.1 14.4l-2 2v-4.7h4.7L6 13.5a5.5 5.5 0 0 0 9.5-3.5Z"/></svg>
+        </button>{recordCount && <span className={`tg-count${recordCount.updating ? " is-updating" : ""}`} role="status" aria-live="polite" title={recordCount.updating ? "Updating the record count" : recordCount.total === undefined ? "Dataverse did not report a reliable total for this view." : undefined}>
+          {recordCountText(recordCount.loaded, recordCount.total, rows && rows.length !== tasks.length ? rows.length : undefined)}
+        </span>}</span>
+        <span className="tg-actions">
+          {dependencies && <button type="button" role="switch" className={`tg-deps-toggle${showDependencies ? " selected" : ""}`} aria-checked={showDependencies} title={showDependencies ? "Hide dependency lines" : "Show dependency lines"} onClick={()=>setShowDependencies(visible=>!visible)}><span className="tg-switch" aria-hidden="true"><span/></span>Dependencies</button>}
+          {dependencyNote && <span className={`tg-deps-status${dependencyNote.error ? " error" : ""}`} role="status" title={dependencyNote.title}>{dependencyNote.text}</span>}
+          {hierarchy && hierarchy.waitingCount>0 && <span className="tg-waiting" title={`These ${items} are shown at the top level because their parent is not in the loaded rows: it may be filtered out, on a later page or not accessible.`}>{hierarchy.waitingCount} without loaded parent</span>}
+        </span>
+      </div>
+      <div className="tg-toolbar-row tg-commands">
+        {search?.label && <form className="tg-search" role="search" onSubmit={event=>{ event.preventDefault(); changeCriteria({...criteria,search:searchDraft}); }}>
+          <button type="submit" className="tg-search-go" disabled={loading} aria-label={`Search ${search.label}`} title="Search"><svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><circle cx="6.8" cy="6.8" r="4.6"/><path d="m10.2 10.2 4 4"/></svg></button>
+          <label className="tg-search-field">
+            <span className="tg-visually-hidden">Search {search.label}</span>
+            <input type="search" value={searchDraft} placeholder={`Search ${search.label}…`} aria-label={`Search ${search.label} (contains)`} onChange={event=>setSearchDraft(event.target.value)}/>
+          </label>
+          {criteria.search && <button type="button" className="tg-search-clear" disabled={loading} aria-label={`Clear search for ${search.label}`} title="Clear search" onClick={()=>changeCriteria({...criteria,search:""})}>{"✕"}</button>}
+        </form>}
+        {filterColumns.length > 0 && <span className="tg-popover-anchor">
+          <button ref={filterButtonRef} type="button" className={`tg-filter-toggle${criteria.filters.length ? " selected" : ""}`} aria-expanded={Boolean(editor)} aria-haspopup="dialog" aria-controls={editor ? `${instanceId}-filters` : undefined} disabled={loading}
+            onClick={()=>editor ? setEditor(undefined) : openEditor((filterColumns.find(column => !criteria.filters.some(filter => filter.column === column.name)) ?? filterColumns[0]).name)}>
+            <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2 3h12l-4.6 5.4V13l-2.8 1.2V8.4Z"/></svg>
+            {`Filters${criteria.filters.length ? ` (${criteria.filters.length})` : ""}`}
+          </button>
+          {editor && (() => {
+            const column = filterColumns.find(candidate => candidate.name === editor.column);
+            if (!column) return null;
+            const valueLabel = `${column.label} value`;
+            return <div ref={popoverRef} id={`${instanceId}-filters`} className="tg-popover tg-filter-editor" role="dialog" aria-label={`Filter ${column.label}`}>
+              <label><span>Column</span>
+                <select value={column.name} onChange={event=>openEditor(event.target.value)}>
+                  {filterColumns.map(option => <option key={option.name} value={option.name}>{option.label}</option>)}
+                </select>
+              </label>
+              <label><span>Condition</span>
+                <select value={editor.operator} disabled={FILTER_OPERATORS[column.kind].length === 1} onChange={event=>setEditor({...editor,operator:event.target.value as FilterOperator,error:undefined})}>
+                  {FILTER_OPERATORS[column.kind].map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+                </select>
+              </label>
+              <label><span>Value</span>
+                {column.kind === "choice"
+                  ? <select value={editor.value} aria-label={valueLabel} disabled={!column.options} onChange={event=>setEditor({...editor,value:event.target.value,error:undefined})}>
+                      <option value="">{column.options ? "Select…" : column.optionsError ? "Unavailable" : "Loading…"}</option>
+                      {(column.options ?? []).map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+                    </select>
+                  : <input type={column.kind === "date" ? "date" : "text"} value={editor.value} aria-label={valueLabel} aria-invalid={Boolean(editor.error)}
+                      onChange={event=>setEditor({...editor,value:event.target.value,error:undefined})}
+                      onKeyDown={event=>{ if (event.key === "Enter") { event.preventDefault(); applyEditor(); } }}/>}
+              </label>
+              {(editor.error || column.optionsError) && <span className="tg-filter-error" role="alert">{editor.error ?? column.optionsError}</span>}
+              <span className="tg-popover-actions">
+                <button type="button" className="tg-apply" disabled={loading} onClick={applyEditor}>Apply</button>
+                <button type="button" onClick={()=>{ setEditor(undefined); filterButtonRef.current?.focus(); }}>Cancel</button>
+              </span>
+            </div>;
+          })()}
+        </span>}
         {layout.showCreatedOnFilter && <label className="tg-filter">{labels.createdOn}
           <select value={filters.createdOn} onChange={event=>changeFilters({...filters,createdOn:event.target.value as DateFilter})}>
             <option value="all">All dates</option>
@@ -490,28 +606,42 @@ export const Gantt: React.FC<Props> = ({tasks,hierarchy,dependencies,pageSize = 
             <option value="lastMonth">Last month</option>
           </select>
         </label>
-        {hasActiveFilters && <button className="tg-clear" onClick={()=>changeFilters({status:"all",createdOn:"all",dueDate:"all"})}>Clear filters</button>}
-      </span>
-      <span className="tg-actions">
-        {dependencies && <button type="button" className={`tg-deps-toggle${showDependencies ? " selected" : ""}`} aria-pressed={showDependencies} title={showDependencies ? "Hide dependency lines" : "Show dependency lines"} onClick={()=>setShowDependencies(visible=>!visible)}>Dependencies</button>}
-        {dependencyNote && <span className={`tg-deps-status${dependencyNote.error ? " error" : ""}`} role="status" title={dependencyNote.title}>{dependencyNote.text}</span>}
-        {hierarchy && hierarchy.waitingCount>0 && <span className="tg-waiting" title={`These ${items} are shown at the top level because their parent is not in the loaded rows: it may be filtered out, on a later page or not accessible.`}>{hierarchy.waitingCount} without loaded parent</span>}
-        {tasks.length>10 &&<button title={`Return to the first ${items}`} aria-label={`Return to the first ${items}`} onClick={()=>scrollRef.current?.scrollTo({top:0,behavior:"smooth"})}>{"\u2191"}</button>}
-        {layout.showStatusFilter && <span className="tg-legend" role="group" aria-label="Status filter">
+        {layout.showStatusFilter && <span className="tg-status-filter" role="group" aria-label="Status filter">
           <button type="button" aria-pressed={filters.status==="all"} className={filters.status==="all" ? "selected" : ""} onClick={()=>changeFilters({...filters,status:"all"})}>All</button>
-          <button type="button" aria-pressed={filters.status==="active"} className={filters.status==="active" ? "selected" : ""} onClick={()=>changeFilters({...filters,status:"active"})}><i className="active"/>Active</button>
-          <button type="button" aria-pressed={filters.status==="completed"} className={filters.status==="completed" ? "selected" : ""} onClick={()=>changeFilters({...filters,status:"completed"})}><i className="completed"/>Completed</button>
-          <button type="button" aria-pressed={filters.status==="overdue"} className={filters.status==="overdue" ? "selected" : ""} onClick={()=>changeFilters({...filters,status:"overdue"})}><i className="overdue"/>Overdue</button>
+          <button type="button" aria-pressed={filters.status==="active"} className={filters.status==="active" ? "selected" : ""} onClick={()=>changeFilters({...filters,status:"active"})}>Active</button>
+          <button type="button" aria-pressed={filters.status==="completed"} className={filters.status==="completed" ? "selected" : ""} onClick={()=>changeFilters({...filters,status:"completed"})}>Completed</button>
+          <button type="button" aria-pressed={filters.status==="overdue"} className={filters.status==="overdue" ? "selected" : ""} onClick={()=>changeFilters({...filters,status:"overdue"})}>Overdue</button>
         </span>}
-      </span>
+        {hasActiveFilters && (onClearAll
+          ? <button className="tg-clear" type="button" onClick={()=>{ scrollRef.current?.scrollTo({top:0,left:0,behavior:"auto"}); setEditor(undefined); onClearAll(); }}>Clear all filters</button>
+          : <button className="tg-clear" type="button" onClick={()=>changeFilters({status:"all",createdOn:"all",dueDate:"all"})}>Clear filters</button>)}
+        <button type="button" className="tg-today-button" title="Scroll the timeline to today" onClick={()=>centreToday("instant")}>
+          <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><rect x="2" y="3" width="12" height="11" rx="1.5"/><path d="M2 6.5h12M5.5 1.8v2.6M10.5 1.8v2.6"/></svg>Today
+        </button>
+      </div>
       {layout.notice && <span className="tg-notice" role="status">{layout.notice}</span>}
+      {(search?.error || hasSearchOrFilters || criteriaNotice) && <div className="tg-criteria">
+        {search?.error && <span className="tg-notice" role="status">{search.error}</span>}
+        {hasSearchOrFilters && <span className="tg-chips" role="list" aria-label="Active search and filters">
+          {criteria.search && search?.label && <span className="tg-chip" role="listitem">{`${search.label} contains “${criteria.search}”`}
+            <button type="button" disabled={loading} aria-label={`Clear search: ${search.label} contains “${criteria.search}”`} title="Clear search" onClick={()=>changeCriteria({...criteria,search:""})}>{"✕"}</button></span>}
+          {criteria.filters.map(filter => {
+            const description = describeFilter(filter, columnLabel(filter.column));
+            return <span className="tg-chip" role="listitem" key={filter.column}>
+              <button type="button" className="tg-chip-edit" disabled={loading || !filterColumns.some(column => column.name === filter.column)} title={`Edit filter: ${description}`} onClick={()=>openEditor(filter.column)}>{description}</button>
+              <button type="button" disabled={loading} aria-label={`Clear filter: ${description}`} title="Clear filter" onClick={()=>changeCriteria({...criteria,filters:criteria.filters.filter(existing => existing.column !== filter.column)})}>{"✕"}</button>
+            </span>;
+          })}
+        </span>}
+        {criteriaNotice && <span className="tg-notice" role="status">{criteriaNotice}</span>}
+      </div>}
     </header>
-    <div ref={scrollRef} className="tg-scroll">
+    <div ref={scrollRef} className="tg-scroll" onScroll={()=>{ if (tipTarget.current) placeTip(); }}>
       <div className="tg-head" style={{gridTemplateColumns:grid}}>
         {renderSortHeader(compactMode ? labels.compactTask : labels.task,"task","tg-col-task")}
         {showAssignedColumn && renderSortHeader(labels.owner,"assignedTo","tg-col-assigned")}
-        {showDescriptionColumn && <div className="tg-hcell tg-sticky tg-col-description" role="columnheader" aria-sort="none">{labels.description}</div>}
-        {layout.showStatus && <div className="tg-hcell tg-sticky tg-col-status" role="columnheader" aria-sort="none">{labels.status}</div>}
+        {showDescriptionColumn && <div className="tg-hcell tg-sticky tg-col-description" role="columnheader" aria-sort="none">{labels.description}{filterMark("description")}</div>}
+        {layout.showStatus && <div className="tg-hcell tg-sticky tg-col-status" role="columnheader" aria-sort="none">{labels.status}{filterMark("status")}</div>}
         {!compactMode && renderSortHeader(labels.start,"startDate","tg-col-start")}
         {compactMode
           ? <div className="tg-hcell tg-sticky tg-col-due tg-schedule-head" role="columnheader" aria-sort={sorting?.key === "startDate" ? (sorting.direction === "asc" ? "ascending" : "descending") : sorting?.key === "dueDate" ? (sorting.direction === "asc" ? "ascending" : "descending") : "none"}>
@@ -520,11 +650,11 @@ export const Gantt: React.FC<Props> = ({tasks,hierarchy,dependencies,pageSize = 
             </div>
           : renderSortHeader(labels.due,"dueDate","tg-col-due")}
         <div className="tg-calendar" style={{gridTemplateColumns:timelineGrid}}>
-          {dateCells.map((d,i)=><div key={i} className={d.getDay()%6===0?"weekend":""}><b>{d.getDate()}</b><small>{d.toLocaleDateString(undefined,{weekday:"narrow"})}</small></div>)}
+          {dateCells.map((d,i)=><div key={i} className={`${d.getDay()%6===0?"weekend":""}${i===todayIndex?" tg-today-cell":""}`} aria-current={i===todayIndex ? "date" : undefined}><b>{d.getDate()}</b><small>{d.toLocaleDateString(undefined,{weekday:"narrow"})}</small></div>)}
           {todayIndex>=0&&todayIndex<numberOfDays&&<em ref={todayRef} className="tg-today" data-tg-today="true" style={{left:`${todayIndex*dayWidth+(dayWidth/2)}px`}}/>}
         </div>
       </div>
-      {!tasks.length && <div className="tg-empty">{loading ? `Loading ${items}...` : hasActiveFilters ? `No ${items} match the selected filters` : `No ${items} found.`}</div>}
+      {!tasks.length && <div className="tg-empty">{loading ? `Loading ${items}...` : hasSearchOrFilters ? `No ${items} match the search and filters` : hasActiveFilters ? `No ${items} match the selected filters` : `No ${items} found.`}</div>}
       {wrapRows(rowEntries.map(({task:t,row})=>{
         const schedule = getScheduleState(t);
         const summary = row?.summary ?? null;
@@ -535,16 +665,16 @@ export const Gantt: React.FC<Props> = ({tasks,hierarchy,dependencies,pageSize = 
         const unscheduled = !drawn && schedule === "unscheduled";
         const reversedText = `${labels.due} is earlier than ${labels.start}`;
         const missingText = `Missing ${[!hasDate(t.start) && labels.start, !hasDate(t.due) && labels.due].filter(Boolean).join(" and ")}`;
-        const urgency = getTaskUrgency(t, now);
-        const urgent = (urgency === "overdue" || urgency === "dueSoon") && hasDate(t.due);
+        const deadline = rowDeadline(t, today, thresholds);
+        const tone = barTone(t, deadline);
+        const deadlineNote = deadline && deadline.level !== "scheduled" && hasDate(t.due) ? `${deadlineText(deadline)} \u2014 due ${fmt(t.due)}` : "";
         const range = `${fmtOptional(t.start)} - ${fmtOptional(t.due)}`;
         const startDayIndex = hasDate(t.start) ? Math.max(0,Math.round((startOfDay(t.start).getTime()-timelineStart.getTime())/DAY)) : 0;
         const inclusiveDurationDays = schedule === "scheduled" && hasDate(t.start) && hasDate(t.due) ? Math.max(1,Math.round((startOfDay(t.due).getTime()-startOfDay(t.start).getTime())/DAY)+1) : 0;
         const barLeft = startDayIndex * dayWidth;
         const barWidth = inclusiveDurationDays * dayWidth;
-        const barTitle = urgent && hasDate(t.due) ? urgencyText(urgency,t.due) : `${t.name}: ${range}`;
-        const barAriaLabel = urgent && hasDate(t.due) ? `${t.name}: ${urgencyText(urgency,t.due)}` : `${t.name}: ${range}`;
-        const barClass = urgency === "overdue" ? "overdue" : urgency === "dueSoon" ? "due-soon" : t.status.toLowerCase();
+        const barTitle = deadlineNote ? `${t.name}: ${range}. ${deadlineNote}` : `${t.name}: ${range}`;
+        const barAriaLabel = barTitle;
         const scheduleAriaLabel = unscheduled
           ? `${t.name} is unscheduled. ${missingText}.`
           : `${t.name} schedule from ${fmtOptional(t.start)} to ${fmtOptional(t.due)}${invalidDates ? `. Invalid dates: ${reversedText}.` : ""}`;
@@ -558,13 +688,13 @@ export const Gantt: React.FC<Props> = ({tasks,hierarchy,dependencies,pageSize = 
           <div className="tg-task-cell tg-sticky tg-col-task" style={row ? {paddingLeft:`calc(clamp(6px, 1vw, 10px) + ${indent}px)`} : undefined}>
             <span className="tg-task-title">{row && (row.hasChildren
               ? <button type="button" className="tg-toggle" aria-expanded={row.expanded} aria-label={`${row.expanded ? "Collapse" : "Expand"} ${t.name}`} title={row.expanded ? "Collapse" : "Expand"} onClick={()=>toggleRow(t.recordId)}><span aria-hidden="true">{row.expanded ? "▾" : "▸"}</span></button>
-              : <span className="tg-toggle-spacer" aria-hidden="true"/>)}<button className="tg-link" onClick={()=>onOpen(t.recordId)} title={t.name} aria-label={layout.showOwner ? `${t.name}, owner ${t.assignedTo}` : t.name}>{t.name}</button><UrgencyIndicator urgency={urgency} due={t.due}/></span>
+              : <span className="tg-toggle-spacer" aria-hidden="true"/>)}<button className="tg-link" onClick={()=>onOpen(t.recordId)} title={t.name} aria-label={layout.showOwner ? `${t.name}, owner ${t.assignedTo}` : t.name}>{t.name}</button><OverdueIndicator deadline={deadline} tip={tipHandlers}/></span>
             {row?.parentMissing && <span className="tg-parent-note" title={parentName ? `Parent ${parentName} is not in the loaded rows` : "The parent is not in the loaded rows"}><span aria-hidden="true">{"↳"} </span>{parentName ?? "Parent not loaded"}</span>}
             {compactMode && layout.showOwner && <span className="tg-owner">{t.assignedTo}</span>}
           </div>
           {showAssignedColumn && <div className="tg-sticky tg-col-assigned">{t.assignedTo}</div>}
           {showDescriptionColumn && <div className="tg-sticky tg-col-description"><span className="tg-description" title={t.description}>{t.description}</span></div>}
-          {layout.showStatus && <div className="tg-sticky tg-col-status"><span className={`tg-status ${t.status.toLowerCase()}`}>{t.statusLabel || t.status}</span></div>}
+          {layout.showStatus && <div className="tg-sticky tg-col-status"><span className={`tg-status ${t.status.toLowerCase()}`}>{t.statusLabel || (t.status === "Neutral" ? "" : t.status)}</span></div>}
           {!compactMode && <div className="tg-sticky tg-col-start">{fmtOptional(t.start)}</div>}
           <div className="tg-schedule tg-sticky tg-col-due" aria-label={scheduleAriaLabel}>
             {compactMode
@@ -581,12 +711,32 @@ export const Gantt: React.FC<Props> = ({tasks,hierarchy,dependencies,pageSize = 
               ? <span className="tg-warning" title={reversedText}>Invalid dates</span>
               : milestoneDay
               ? null
-              : <span className={`tg-bar ${barClass}`} style={{left:`${barLeft}px`,width:`${barWidth}px`}} title={barTitle} aria-label={barAriaLabel}>{t.status==="Completed" ? "\u2713" : ""}</span>}
-            {milestoneDay && <span className={`tg-milestone ${t.status.toLowerCase()}`} style={{left:`${dayIndexOf(milestoneDay)*dayWidth+(dayWidth/2)}px`}} title={milestoneText} aria-label={milestoneText}/>}
+              : <span className={`tg-bar ${tone}`} style={{left:`${barLeft}px`,width:`${barWidth}px`}} title={barTitle} aria-label={barAriaLabel}>{t.status==="Completed" ? "\u2713" : ""}</span>}
+            {milestoneDay && <span className={`tg-milestone ${tone}`} style={{left:`${dayIndexOf(milestoneDay)*dayWidth+(dayWidth/2)}px`}} title={deadlineNote ? `${milestoneText}. ${deadlineNote}` : milestoneText} aria-label={deadlineNote ? `${milestoneText}. ${deadlineNote}` : milestoneText}/>}
             {todayIndex>=0&&todayIndex<numberOfDays&&<em className="tg-today" style={{left:`${todayIndex*dayWidth+(dayWidth/2)}px`}}/>}
           </div>
         </div>}))}
-      {onLoadMore && <button className="tg-more" title={`Load the next ${pageSize} ${items}`} aria-label={`Load the next ${pageSize} ${items}`} disabled={loading} onClick={onLoadMore}>{loading ? "..." : "\u2193"}</button>}
     </div>
+    <footer className="tg-footer">
+      {layout.showDeadlines
+        ? <span className="tg-legend" role="list" aria-label="Colour legend">
+            <span role="listitem"><i className="scheduled" aria-hidden="true"/>Scheduled</span>
+            <span role="listitem" title={`Yellow from ${thresholds.approaching} days before ${labels.due}, orange from ${thresholds.near}, dark orange from ${thresholds.imminent} (0 is the due day)`}><i className="approaching" aria-hidden="true"/><i className="near" aria-hidden="true"/><i className="imminent" aria-hidden="true"/>Due soon</span>
+            <span role="listitem"><i className="overdue" aria-hidden="true"/>Overdue</span>
+            <span role="listitem"><i className="completed" aria-hidden="true"/>Completed</span>
+            {layout.showCanceled && <span role="listitem"><i className="canceled" aria-hidden="true"/>Canceled</span>}
+            {hierarchy && <span role="listitem"><i className="summary" aria-hidden="true"/>Summary</span>}
+          </span>
+        : <span className="tg-legend-off" title="Set the Completed status values or a progress column in the control properties to colour bars by deadline. Status labels are never used to decide completion.">Deadline colours off: completion not configured</span>}
+      <span className="tg-footer-center">
+        {onLoadMore && <button type="button" className="tg-more" title={`Load the next ${pageSize} ${items}`} aria-label={`Load the next ${pageSize} ${items}`} disabled={loading} onClick={onLoadMore}>Load more</button>}
+      </span>
+      <span className="tg-footer-end">
+        {tasks.length>10 && <button type="button" className="tg-top" title={`Return to the first ${items}`} aria-label={`Return to the first ${items}`} onClick={()=>scrollRef.current?.scrollTo({top:0,behavior:"smooth"})}>{"↑"}</button>}
+      </span>
+    </footer>
+    {tip && <div className="tg-tip" role="tooltip" style={{left:`${tip.left}px`,top:`${tip.top}px`}}>{tip.text}</div>}
+    {infoOpen && <div id={overlayId} className="tg-info-overlay" role="tooltip" style={infoPosition ? {left:`${infoPosition.left}px`,top:`${infoPosition.top}px`} : undefined}>{`Task Gantt PCF version ${CONTROL_VERSION}`}</div>}
   </section>;
 };
+

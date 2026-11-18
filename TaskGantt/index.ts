@@ -1,12 +1,16 @@
 import { IInputs, IOutputs } from "./generated/ManifestTypes";
 import * as React from "react";
 import { cleanupTaskGanttOverlays, DateFilter, Gantt, LicenseDebugInfo, LicenseState, SortState, sortTasksForDisplay, StatusFilter, TaskItem } from "./src/Gantt";
-import { buildLayout, ColumnLike, FieldMap, GanttLayout, hasHierarchy, isProjectTaskTable, mapRecord, normalizeId, resolveFieldMap, toParentRef } from "./src/fieldMap";
+import { buildLayout, ColumnLike, CompletionConfig, dateBehaviorOf, FieldMap, GanttLayout, hasHierarchy, isDateOnlyColumn, isProjectTaskTable, mapRecord, normalizeId, resolveFieldMap, toParentRef } from "./src/fieldMap";
+import { browserOffset, DateBehavior, DeadlineThresholds, lastOverdueDay, resolveThresholds, userCalendarDay } from "./src/deadline";
 import { buildHierarchy, Hierarchy } from "./src/hierarchy";
 import { customLinkSource, LinkSource, PROJECT_OPERATIONS_LINKS } from "./src/dependencies";
-import { DependencyLoader, DependencyView, WebApiLike } from "./src/dependencyLoader";
+import { DependencyLoader, DependencyView, ScopedTask, WebApiLike } from "./src/dependencyLoader";
+import { ColumnAccess, metadataClientUrl, webApiReader } from "./src/columnAccess";
+import { AppliedFilter, buildFilterExpression, ChoiceOption, choiceOptionsFromMetadata, cloneFilter, criteriaConditions, criteriaKey, currentHostFilter, EMPTY_CRITERIA, FilterColumn, filterKind, GanttCriteria, matchingTotal, MatchingTotal, normalizeCriteria, SearchState } from "./src/viewCriteria";
 
 type ConditionExpression = ComponentFramework.PropertyHelper.DataSetApi.ConditionExpression;
+type FilterExpression = ComponentFramework.PropertyHelper.DataSetApi.FilterExpression;
 type ConditionOperator = ComponentFramework.PropertyHelper.DataSetApi.Types.ConditionOperator;
 type SortStatus = ComponentFramework.PropertyHelper.DataSetApi.SortStatus;
 
@@ -32,7 +36,19 @@ const DATE_FILTER_OPERATORS: Record<Exclude<DateFilter, "all">, ConditionOperato
 };
 
 const PROJECT_ENTITY = "msdyn_project";
-const NO_PROJECT_SCOPE = "Dependencies need the current project. Open the Gantt on a project form, or add the Project column to the view.";
+const NO_PROJECT_COLUMN = "Dependency lines need each task's project. Add the Project column to this view, or open the Gantt on a project form.";
+const NO_PROJECT_VALUES = "None of the loaded tasks has a Project value, so their dependency links cannot be read. Check the Project column in this view.";
+const HOST_FILTER_CHANGED = "The view's filters were changed outside the Gantt, so the Gantt's search and filters were cleared. The view's filters are unchanged.";
+const HOST_FILTER_UNAVAILABLE = "Search and filters were not applied: the host did not return its current filter, so it could not be preserved.";
+const LOGICAL_NAME = /^[a-z_][a-z0-9_]*$/;
+// ConditionOperator values supported by the PCF typings: NotEqual, GreaterEqual, In, OnOrBefore.
+const CONDITION_NOT_EQUAL = 1;
+const CONDITION_GREATER_EQUAL = 4;
+const CONDITION_IN = 8;
+const CONDITION_ON_OR_BEFORE = 26;
+// AttributeMetadata DateTimeBehavior: numeric in model-driven host metadata, named in Web API-shaped metadata.
+const DATE_BEHAVIORS: Record<string, DateBehavior> = { "1": "userLocal", "2": "dateOnly", "3": "timeZoneIndependent", UserLocal: "userLocal", DateOnly: "dateOnly", TimeZoneIndependent: "timeZoneIndependent" };
+const DEFAULT_FILTER_SIGNATURE = "status:all:|createdOn:all|dueDate:all";
 const FLAT_PAGE_SIZE = 10;
 const HIERARCHY_PAGE_SIZE = 50;
 const LICENSE_CACHE_PREFIX = "modernGanttLicense";
@@ -48,14 +64,22 @@ export class TaskGantt implements ComponentFramework.ReactControl<IInputs, IOutp
   private dependencyLoader?: DependencyLoader;
   private filters: FilterState = { status: "all", createdOn: "all", dueDate: "all" };
   private sorting: SortState;
-  private lastAppliedFilterSignature = "status:all:|createdOn:all|dueDate:all";
+  private lastAppliedFilterSignature = DEFAULT_FILTER_SIGNATURE;
+  // Search and column filters; with the toolbar filters they are the Gantt's own conditions inside the dataset filter.
+  private criteria: GanttCriteria = EMPTY_CRITERIA;
+  private appliedFilter?: AppliedFilter;
+  private criteriaNotice = "";
+  private columnAccess?: ColumnAccess;
+  private columnAccessKey = "";
+  private choiceOptions = new Map<string, ChoiceOption[] | "pending" | { error: string }>();
+  private searchMetadata = new Map<string, SearchState | "pending">();
+  // Dataverse date behavior of each mapped Date and Time column; user local until metadata says otherwise.
+  private dateBehaviors = new Map<string, DateBehavior | "pending">();
+  private lastRecordCount?: { loaded: number; total: MatchingTotal };
   private lastAppliedSortingSignature = "";
   private manualRefreshInFlight = false;
   private manualRefreshSawLoading = false;
   private instanceId = `taskgantt-${Math.random().toString(36).slice(2)}`;
-  private completedRawValue: string | undefined;
-  private observedActiveRawValue: string | undefined;
-  private lastStatusResolutionLogSignature = "";
   private licenseState: LicenseState = "checking";
   private licenseMessage = "Validating license...";
   private licenseDebugInfo?: LicenseDebugInfo;
@@ -67,8 +91,10 @@ export class TaskGantt implements ComponentFramework.ReactControl<IInputs, IOutp
   private licenseWatchdogTimer?: number;
   private dataverseCacheCheckedForKey = "";
   private dataverseCacheCheckInFlight = false;
+  // Set by destroy: late async results (license, metadata, links, permissions) must not render a destroyed control.
+  private destroyed = false;
 
-  private static readonly BUILD_VERSION = "3.5.0";
+  private static readonly BUILD_VERSION = "3.7.1";
   private static readonly CONTROL_CODE = "moderngantt";
   private static readonly LICENSE_ENDPOINT = "https://modern365timeline-license-fkh6gbgdhnchgyhj.westeurope-01.azurewebsites.net/api/validateLicense";
 
@@ -104,17 +130,20 @@ export class TaskGantt implements ComponentFramework.ReactControl<IInputs, IOutp
       }
     }
 
-    const stateColumn = fieldMap.columns.status;
-    if (fieldMap.isTaskTable && this.filters.status === "all" && stateColumn && ds.sortedRecordIds.length) {
-      this.observeStatusValues(ds, stateColumn);
-    }
-
-    const completedRawValue = this.getCompletedRawValue(fieldMap);
-    const mappedTasks: TaskItem[] = ds.sortedRecordIds.map((id: string) => mapRecord(id, ds.records[id], fieldMap, completedRawValue));
+    // One "today" and one date conversion, in the user's Dynamics time zone, for bars, colours, icons and filters.
+    const offsetFor = this.getOffsetReader(context);
+    const today = userCalendarDay(new Date(), offsetFor(new Date()));
+    const table = ds.getTargetEntityType?.() ?? "";
+    const behaviorOf = (column: ColumnLike) => this.getDateBehavior(context, table, column);
+    const mappedTasks: TaskItem[] = ds.sortedRecordIds.map((id: string) => mapRecord(id, ds.records[id], fieldMap, { behaviorOf, offsetFor }));
     const tasks: TaskItem[] = sortTasksForDisplay(mappedTasks, this.sorting);
     this.logSortDiagnostics(mappedTasks, tasks);
 
     let layout: GanttLayout = buildLayout(fieldMap);
+    const deadline = this.getThresholds(context);
+    const statusValueNotice = this.checkStatusValues(context, ds, fieldMap);
+    const notices = [layout.notice, deadline.error, statusValueNotice].filter(Boolean);
+    if (notices.length) layout = { ...layout, notice: notices.join(" ") };
     let hierarchy: Hierarchy | undefined;
     if (hierarchyEnabled) {
       // A user sort orders siblings; otherwise the mapped sequence does, falling back to the server order.
@@ -132,8 +161,25 @@ export class TaskGantt implements ComponentFramework.ReactControl<IInputs, IOutp
 
     const dependencies = this.getDependencies(context, ds);
 
+    if (!ds.loading) this.reconcileHostFilter(ds);
+    if (this.licenseState === "licensed") this.ensureColumnAccess(context, ds);
+    const filterColumns = this.getFilterColumns(context, ds);
+    const search = this.getSearchState(context, ds);
+    if (this.columnAccess?.failed && !this.criteriaNotice) this.criteriaNotice = "Column filters are unavailable: column permissions could not be verified.";
+    const filteredFields = this.getFilteredFields(fieldMap);
+
+    // Counts only dataset records. The total is Dataverse's own count for the current view, search and filters;
+    // while a request is running the last count stays visible and is marked as updating.
+    if (!ds.loading) {
+      const loaded = ds.sortedRecordIds.length;
+      this.lastRecordCount = { loaded, total: matchingTotal(ds.paging.totalResultCount, loaded, ds.paging.hasNextPage) };
+    }
+    const recordCount = this.lastRecordCount ? { ...this.lastRecordCount, updating: ds.loading } : undefined;
+
     return React.createElement(Gantt, {
       tasks,
+      today,
+      thresholds: deadline.thresholds,
       hierarchy,
       dependencies,
       pageSize,
@@ -142,6 +188,14 @@ export class TaskGantt implements ComponentFramework.ReactControl<IInputs, IOutp
       allocatedWidth,
       loading: ds.loading,
       filters: this.filters,
+      criteria: this.criteria,
+      filterColumns,
+      search,
+      filteredFields,
+      criteriaNotice: this.criteriaNotice,
+      recordCount,
+      onCriteriaChange: (criteria: GanttCriteria) => this.applyServerFilter(ds, this.filters, criteria),
+      onClearAll: () => this.applyServerFilter(ds, { status: "all", createdOn: "all", dueDate: "all" }, EMPTY_CRITERIA),
       sorting: this.sorting,
       licenseState: this.licenseState,
       licenseMessage: this.licenseMessage,
@@ -386,7 +440,81 @@ export class TaskGantt implements ComponentFramework.ReactControl<IInputs, IOutp
   }
 
   private getFieldMap(ds: ComponentFramework.PropertyTypes.DataSet): FieldMap {
-    return resolveFieldMap(ds.columns, ds.getTargetEntityType?.());
+    return resolveFieldMap(ds.columns, ds.getTargetEntityType?.(), this.getCompletionConfig());
+  }
+
+  private parameter(name: string): unknown {
+    const parameters = this.context?.parameters as unknown as Record<string, { raw?: unknown } | undefined> | undefined;
+    return parameters?.[name]?.raw;
+  }
+
+  // Explicit completion semantics (raw values only). Empty settings keep the built-in Task statecode or Neutral rows.
+  private getCompletionConfig(): CompletionConfig {
+    const text = (name: string) => { const raw = this.parameter(name); return typeof raw === "string" ? raw : null; };
+    const progress = this.parameter("progressCompleteValue");
+    return {
+      completedValues: text("completedStatusValues"),
+      canceledValues: text("canceledStatusValues"),
+      progressColumn: text("progressColumn"),
+      progressCompleteValue: typeof progress === "number" ? progress : null
+    };
+  }
+
+  private getThresholds(context: ComponentFramework.Context<IInputs>): { thresholds: DeadlineThresholds; error?: string } {
+    const parameters = context.parameters as unknown as Record<string, { raw?: unknown } | undefined>;
+    return resolveThresholds({ approaching: parameters.dueSoonDays?.raw, near: parameters.dueNearDays?.raw, imminent: parameters.dueImminentDays?.raw });
+  }
+
+  // The Dynamics user's time zone offset (minutes east of UTC) for an instant; the browser's only when the host has none.
+  private getOffsetReader(context: ComponentFramework.Context<IInputs>): (instant: Date) => number {
+    const settings = context.userSettings as unknown as { getTimeZoneOffsetMinutes?: (date?: Date) => number } | undefined;
+    if (typeof settings?.getTimeZoneOffsetMinutes !== "function") return browserOffset;
+    return (instant: Date) => {
+      try {
+        const offset = settings.getTimeZoneOffsetMinutes?.(instant);
+        return typeof offset === "number" && Number.isFinite(offset) ? offset : browserOffset(instant);
+      } catch {
+        return browserOffset(instant);
+      }
+    };
+  }
+
+  // Date Only columns are known from the dataset; Date and Time columns are user local unless metadata says time zone
+  // independent. Metadata is read once per column.
+  private getDateBehavior(context: ComponentFramework.Context<IInputs>, table: string, column: ColumnLike): DateBehavior {
+    if (isDateOnlyColumn(column) || !table || !LOGICAL_NAME.test(column.name)) return dateBehaviorOf(column);
+    const key = `${table}|${column.name}`;
+    const cached = this.dateBehaviors.get(key);
+    if (cached && cached !== "pending") return cached;
+    if (!cached && typeof context.utils?.getEntityMetadata === "function") {
+      this.dateBehaviors.set(key, "pending");
+      void this.loadDateBehavior(context, table, column.name, key);
+    }
+    return "userLocal";
+  }
+
+  private async loadDateBehavior(context: ComponentFramework.Context<IInputs>, table: string, name: string, key: string): Promise<void> {
+    let behavior: DateBehavior = "userLocal";
+    try {
+      const metadata = await context.utils.getEntityMetadata(table, [name]) as { Attributes?: { get?: (name: string) => Record<string, unknown> | undefined } };
+      const attribute = metadata?.Attributes?.get?.(name);
+      const raw = attribute?.Behavior ?? (attribute?.DateTimeBehavior as { Value?: unknown } | undefined)?.Value ?? attribute?.DateTimeBehavior;
+      behavior = DATE_BEHAVIORS[String(raw)] ?? "userLocal";
+    } catch (error) {
+      console.error(`TaskGantt could not read the date behavior of ${name}; it is treated as user local.`, error);
+    }
+    this.dateBehaviors.set(key, behavior);
+    if (behavior !== "userLocal") this.requestControlRender();
+  }
+
+  // Configured status values must be options of the Status column; a mistyped value would silently never match.
+  private checkStatusValues(context: ComponentFramework.Context<IInputs>, ds: ComponentFramework.PropertyTypes.DataSet, fieldMap: FieldMap): string | undefined {
+    const completion = fieldMap.completion;
+    if (completion?.kind !== "status" || completion.source !== "configured" || completion.column.name.includes(".")) return undefined;
+    const options = this.getChoiceOptions(context, ds, completion.column.name);
+    if (!Array.isArray(options)) return undefined;
+    const unknown = [...completion.completed, ...completion.canceled].filter(value => !options.some(option => option.value === value));
+    return unknown.length ? `${unknown.join(", ")} ${unknown.length === 1 ? "is not an option" : "are not options"} of ${completion.column.displayName || completion.column.name}; check the Completed and Canceled status values.` : undefined;
   }
 
   // Dependency lines: explicit custom link-table settings win; Project Operations tasks use the verified defaults.
@@ -397,29 +525,40 @@ export class TaskGantt implements ComponentFramework.ReactControl<IInputs, IOutp
     if (text("dependencyMode").trim().toLowerCase() === "off") return undefined;
 
     const custom = customLinkSource({ table: text("dependencyTable"), predecessorColumn: text("dependencyPredecessorColumn"), successorColumn: text("dependencySuccessorColumn") });
-    if (custom.error) return { status: "error", links: [], skipped: [], message: custom.error };
+    if (custom.error) return { status: "error", links: [], skipped: [], message: custom.error, errorKind: "config" };
     const source: LinkSource | undefined = custom.source ?? (isProjectTaskTable(ds.getTargetEntityType?.()) ? PROJECT_OPERATIONS_LINKS : undefined);
     if (!source || !this.dependencyLoader) return undefined;
     if (!ds.sortedRecordIds.length) return { status: "ready", links: [], skipped: [] };
 
-    let scopeId: string | undefined;
+    let tasks: ScopedTask[] = ds.sortedRecordIds.map((id: string) => ({ id }));
+    let unscoped = 0;
     if (source.kind === "projectOperations") {
-      scopeId = this.getProjectScope(context, ds);
-      if (!scopeId) return { status: "error", links: [], skipped: [], message: NO_PROJECT_SCOPE };
+      const scoped = this.getProjectScopes(context, ds);
+      if ("error" in scoped) return { status: "error", links: [], skipped: [], message: scoped.error, errorKind: "noProject" };
+      tasks = scoped.tasks;
+      unscoped = scoped.unscoped;
     }
-    this.dependencyLoader.sync(source, scopeId, ds.sortedRecordIds);
-    return this.dependencyLoader.view();
+    this.dependencyLoader.sync(source, tasks);
+    const view = this.dependencyLoader.view();
+    return unscoped ? { ...view, unscoped } : view;
   }
 
-  // The project hosting the Gantt (project form), or the single project of the loaded tasks when the view includes it.
-  private getProjectScope(context: ComponentFramework.Context<IInputs>, ds: ComponentFramework.PropertyTypes.DataSet): string | undefined {
+  // Each loaded task's project: the hosting project form scopes every row; otherwise each row's own Project lookup
+  // does, so a multi-project view reads every represented project. Rows without a Project value are not read.
+  private getProjectScopes(context: ComponentFramework.Context<IInputs>, ds: ComponentFramework.PropertyTypes.DataSet): { tasks: ScopedTask[]; unscoped: number } | { error: string } {
     const info = (context.mode as unknown as { contextInfo?: { entityTypeName?: string; entityId?: string } }).contextInfo;
-    if (info?.entityTypeName?.toLowerCase() === PROJECT_ENTITY && info.entityId) return normalizeId(info.entityId);
-    if (!ds.columns.some(column => column.name === PROJECT_ENTITY)) return undefined;
-    const projects = new Set(ds.sortedRecordIds
-      .map((id: string) => toParentRef(ds.records[id].getValue(PROJECT_ENTITY), "")?.id)
-      .filter((id): id is string => Boolean(id)));
-    return projects.size === 1 ? Array.from(projects)[0] : undefined;
+    if (info?.entityTypeName?.toLowerCase() === PROJECT_ENTITY && info.entityId) {
+      const scope = normalizeId(info.entityId);
+      return { tasks: ds.sortedRecordIds.map((id: string) => ({ id, scope })), unscoped: 0 };
+    }
+    if (!ds.columns.some(column => column.name === PROJECT_ENTITY)) return { error: NO_PROJECT_COLUMN };
+    const tasks: ScopedTask[] = [];
+    ds.sortedRecordIds.forEach((id: string) => {
+      const scope = toParentRef(ds.records[id].getValue(PROJECT_ENTITY), "")?.id;
+      if (scope) tasks.push({ id, scope });
+    });
+    if (!tasks.length) return { error: NO_PROJECT_VALUES };
+    return { tasks, unscoped: ds.sortedRecordIds.length - tasks.length };
   }
 
   private warnBrokenCycles(recordIds: string[]): void {
@@ -431,103 +570,251 @@ export class TaskGantt implements ComponentFramework.ReactControl<IInputs, IOutp
     }
   }
 
-  // Known raw values (standard Task statecode) win over values observed from formatted labels. Label observation
-  // is kept only for Tasks; custom tables get no Completed value until it can be configured explicitly.
-  private getCompletedRawValue(fieldMap: FieldMap): string | undefined {
-    return fieldMap.completedRawValue ?? (fieldMap.isTaskTable ? this.completedRawValue : undefined);
-  }
-
-  private observeStatusValues(ds: ComponentFramework.PropertyTypes.DataSet, stateColumn: ColumnLike): void {
-    ds.sortedRecordIds.forEach((id: string) => {
-      const record = ds.records[id];
-      const rawValue = record.getValue(stateColumn.name);
-      if (rawValue === null || rawValue === undefined) return;
-
-      const formattedValue = (record.getFormattedValue(stateColumn.name) || "").trim().toLowerCase();
-      if ((formattedValue === "active" || formattedValue === "open") && !this.observedActiveRawValue) {
-        this.observedActiveRawValue = String(rawValue);
-      }
-      if (formattedValue === "completed" && !this.completedRawValue) {
-        this.completedRawValue = String(rawValue);
-      }
-    });
-
-    this.logStatusResolution(stateColumn.name);
-  }
-
-  private logStatusResolution(statusColumnName: string): void {
-    const signature = `${statusColumnName}|${this.observedActiveRawValue || ""}|${this.completedRawValue || ""}`;
-    if (signature === this.lastStatusResolutionLogSignature) return;
-    this.lastStatusResolutionLogSignature = signature;
-    if (typeof process !== "undefined" && process.env && process.env.NODE_ENV !== "production") {
-      console.info("TaskGantt status resolution", {
-        statusColumnName,
-        activeRawValue: this.observedActiveRawValue,
-        completedRawValue: this.completedRawValue
-      });
-    }
-  }
-
   private applyFilters(ds: ComponentFramework.PropertyTypes.DataSet, filters: FilterState): void {
+    this.applyServerFilter(ds, filters, this.criteria);
+  }
+
+  // Toolbar filters, search and column filters become one set of the Gantt's own conditions, ANDed with the host's
+  // current filter (re-derived on every change), then the dataset is queried again from page 1.
+  private applyServerFilter(ds: ComponentFramework.PropertyTypes.DataSet, filters: FilterState, criteria: GanttCriteria): void {
     const fieldMap = this.getFieldMap(ds);
-    const completedRawValue = this.getCompletedRawValue(fieldMap);
-    const signature = this.getFilterSignature(filters, completedRawValue);
+    const nextCriteria = normalizeCriteria(criteria);
+    const today = this.getToday();
+    const signature = `${this.getFilterSignature(filters, fieldMap, today)}|${criteriaKey(nextCriteria)}`;
     if (signature === this.lastAppliedFilterSignature) return;
-    const conditions = this.buildFilterConditions(fieldMap, completedRawValue, filters);
+
+    // A host that cannot report its filter keeps the 3.5.0 behaviour for the toolbar filters; search and column
+    // filters are never offered there.
+    let derived: ReturnType<typeof currentHostFilter> = { host: null };
+    if (typeof ds.filtering.getFilter === "function") {
+      let current: FilterExpression | null;
+      try {
+        current = cloneFilter(ds.filtering.getFilter());
+      } catch (error) {
+        console.error("TaskGantt could not read the host filter.", error);
+        this.criteriaNotice = HOST_FILTER_UNAVAILABLE;
+        this.requestControlRender();
+        return;
+      }
+      derived = currentHostFilter(current, this.appliedFilter);
+    }
+    if (derived === "lost") {
+      this.resetCriteriaForHostChange();
+      return;
+    }
+
+    const own = [
+      ...this.buildFilterConditions(fieldMap, filters, today),
+      ...criteriaConditions(nextCriteria, this.getSearchColumnName())
+    ];
+    const expression = buildFilterExpression(own, derived.host);
 
     this.filters = filters;
+    this.criteria = nextCriteria;
     this.lastAppliedFilterSignature = signature;
+    // Without own conditions the dataset holds only the host's filter, so nothing is owned.
+    this.appliedFilter = expression && own.length ? { expression, host: derived.host, own } : undefined;
+    this.criteriaNotice = "";
 
-    if (!conditions.length) {
+    if (!expression) {
       ds.filtering.clearFilter();
     } else {
-      ds.filtering.setFilter({
-        filterOperator: 0,
-        conditions
-      });
+      ds.filtering.setFilter(expression);
     }
 
+    // Refresh returns the dataset to page 1.
     ds.paging.reset();
     ds.refresh();
   }
 
-  private buildFilterConditions(fieldMap: FieldMap, completedRawValue: string | undefined, filters: FilterState): ConditionExpression[] {
+  // Dynamics replaced or rewrote the Gantt's conditions. Its filter is authoritative and is never overwritten from a guess.
+  private resetCriteriaForHostChange(): void {
+    this.filters = { status: "all", createdOn: "all", dueDate: "all" };
+    this.criteria = EMPTY_CRITERIA;
+    this.appliedFilter = undefined;
+    this.lastAppliedFilterSignature = DEFAULT_FILTER_SIGNATURE;
+    this.criteriaNotice = HOST_FILTER_CHANGED;
+    this.requestControlRender();
+  }
+
+  // After host updates, follow host-side filter changes so a later Gantt change keeps them.
+  private reconcileHostFilter(ds: ComponentFramework.PropertyTypes.DataSet): void {
+    if (!this.appliedFilter || typeof ds.filtering?.getFilter !== "function") return;
+    let current: FilterExpression | null;
+    try { current = cloneFilter(ds.filtering.getFilter()); } catch { return; }
+    const derived = currentHostFilter(current, this.appliedFilter);
+    if (derived === "lost") { this.resetCriteriaForHostChange(); return; }
+    if (current) this.appliedFilter = { ...this.appliedFilter, expression: current, host: derived.host };
+  }
+
+  private filteringSupported(ds: ComponentFramework.PropertyTypes.DataSet): boolean {
+    const filtering = ds.filtering as Partial<ComponentFramework.PropertyHelper.DataSetApi.Filtering> | undefined;
+    return typeof filtering?.getFilter === "function" && typeof filtering.setFilter === "function" && typeof filtering.clearFilter === "function";
+  }
+
+  private ensureColumnAccess(context: ComponentFramework.Context<IInputs>, ds: ComponentFramework.PropertyTypes.DataSet): void {
+    const table = (ds.getTargetEntityType?.() ?? "").toLowerCase();
+    const clientUrl = metadataClientUrl(context);
+    const userId = (context as unknown as { userSettings?: { userId?: string } }).userSettings?.userId ?? "";
+    const key = `${clientUrl ?? ""}|${table}|${userId}`;
+    if (!clientUrl || !table || !userId || key === this.columnAccessKey) return;
+    this.columnAccessKey = key;
+    try {
+      const access = new ColumnAccess(table, userId, webApiReader(clientUrl), () => { if (this.columnAccess === access) this.requestControlRender(); });
+      this.columnAccess = access;
+      void access.load();
+    } catch (error) {
+      console.error("TaskGantt could not check column permissions.", error);
+      this.columnAccess = undefined;
+    }
+  }
+
+  // Columns are offered only when filtering is supported, the column is on the table itself (not a linked table) and
+  // the user may filter by it. Choice options come from metadata, so values are raw and labels are localized.
+  private getFilterColumns(context: ComponentFramework.Context<IInputs>, ds: ComponentFramework.PropertyTypes.DataSet): FilterColumn[] {
+    if (!this.filteringSupported(ds) || !this.columnAccess) return [];
+    const seen = new Set<string>();
+    const result: FilterColumn[] = [];
+    ds.columns.forEach(column => {
+      const name = column.name;
+      const kind = filterKind(column.dataType);
+      if (!kind || !name || name.includes(".") || seen.has(name) || this.columnAccess?.canFilter(name) !== "allowed") return;
+      seen.add(name);
+      const entry: FilterColumn = { name, label: column.displayName || name, kind };
+      if (kind === "choice") {
+        const options = this.getChoiceOptions(context, ds, name);
+        if (Array.isArray(options)) entry.options = options;
+        else if (options && options !== "pending") entry.optionsError = options.error;
+      }
+      result.push(entry);
+    });
+    return result;
+  }
+
+  private getChoiceOptions(context: ComponentFramework.Context<IInputs>, ds: ComponentFramework.PropertyTypes.DataSet, attribute: string): ChoiceOption[] | "pending" | { error: string } {
+    const table = ds.getTargetEntityType?.() ?? "";
+    const key = `${table}|${attribute}`;
+    const cached = this.choiceOptions.get(key);
+    if (cached) return cached;
+    this.choiceOptions.set(key, "pending");
+    void this.loadChoiceOptions(context, table, attribute, key);
+    return "pending";
+  }
+
+  private async loadChoiceOptions(context: ComponentFramework.Context<IInputs>, table: string, attribute: string, key: string): Promise<void> {
+    try {
+      const metadata = await context.utils.getEntityMetadata(table, [attribute]) as { Attributes?: { get?: (name: string) => unknown } };
+      const attributeMetadata = metadata?.Attributes?.get?.(attribute) as { OptionSet?: unknown; _optionSet?: unknown } | undefined;
+      const set = attributeMetadata?.OptionSet ?? attributeMetadata?._optionSet;
+      if (!set) throw new Error("No OptionSet metadata.");
+      const options = choiceOptionsFromMetadata(set);
+      if (!options.length) throw new Error("No options returned.");
+      this.choiceOptions.set(key, options);
+    } catch (error) {
+      console.error(`TaskGantt could not load the choices for ${attribute}.`, error);
+      this.choiceOptions.set(key, { error: "The choices for this column could not be loaded. Refresh the page to retry." });
+    }
+    this.requestControlRender();
+  }
+
+  private getSearchColumnName(): string | undefined {
+    const parameters = this.context?.parameters as unknown as Record<string, { raw?: unknown } | undefined> | undefined;
+    const raw = parameters?.searchColumn?.raw;
+    const name = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+    return name && LOGICAL_NAME.test(name) ? name : undefined;
+  }
+
+  // The configured search column must be a text column the user may filter by. Returns undefined while it is checked.
+  private getSearchState(context: ComponentFramework.Context<IInputs>, ds: ComponentFramework.PropertyTypes.DataSet): SearchState | undefined {
+    const parameters = context.parameters as unknown as Record<string, { raw?: unknown } | undefined>;
+    const raw = typeof parameters.searchColumn?.raw === "string" ? (parameters.searchColumn.raw as string).trim().toLowerCase() : "";
+    if (!raw) return undefined;
+    if (!LOGICAL_NAME.test(raw)) return { error: `Search is unavailable: “${raw}” is not a column logical name.` };
+    if (!this.filteringSupported(ds)) return { error: "Search is unavailable: this host does not let the Gantt filter its records." };
+    const column = ds.columns.find(candidate => candidate.name.toLowerCase() === raw);
+    let state: SearchState;
+    if (column) {
+      state = filterKind(column.dataType) === "text" ? { label: column.displayName || raw } : { error: `Search is unavailable: ${column.displayName || raw} is not a text column.` };
+    } else {
+      const table = ds.getTargetEntityType?.() ?? "";
+      const key = `${table}|${raw}`;
+      const cached = this.searchMetadata.get(key);
+      if (!cached) { this.searchMetadata.set(key, "pending"); void this.loadSearchMetadata(context, key, table, raw); }
+      if (!cached || cached === "pending") return undefined;
+      state = cached;
+    }
+    if (state.error) return state;
+    if (!this.columnAccess || this.columnAccess.failed) return { error: "Search is unavailable: column permissions could not be verified." };
+    const access = this.columnAccess.canFilter(raw);
+    if (access === "denied") return { error: `Search is unavailable: you cannot filter by ${state.label}.` };
+    return access === "allowed" ? state : undefined;
+  }
+
+  private async loadSearchMetadata(context: ComponentFramework.Context<IInputs>, key: string, table: string, name: string): Promise<void> {
+    let state: SearchState;
+    try {
+      const metadata = await context.utils.getEntityMetadata(table, [name]) as { Attributes?: { get?: (name: string) => Record<string, unknown> | undefined } };
+      const attribute = metadata?.Attributes?.get?.(name);
+      const type = attribute?.AttributeType ?? (attribute?.AttributeTypeName as { Value?: string } | undefined)?.Value;
+      const label = typeof attribute?.DisplayName === "string" && attribute.DisplayName ? attribute.DisplayName : name;
+      state = !attribute ? { error: `Search is unavailable: column “${name}” was not found on this table.` }
+        : [14, 7, "String", "Memo", "StringType", "MemoType"].includes(type as string | number) ? { label }
+        : { error: `Search is unavailable: ${label} is not a text column.` };
+    } catch (error) {
+      console.error("TaskGantt could not verify the search column.", error);
+      state = { error: "Search is unavailable: the search column could not be verified." };
+    }
+    this.searchMetadata.set(key, state);
+    this.requestControlRender();
+  }
+
+  // Mapped Gantt columns that currently have a column filter (or the search), for the header indicators.
+  private getFilteredFields(fieldMap: FieldMap): string[] {
+    const filtered = new Set(this.criteria.filters.map(filter => filter.column));
+    const search = this.criteria.search ? this.getSearchColumnName() : undefined;
+    if (search) filtered.add(search);
+    return (Object.keys(fieldMap.columns) as Array<keyof FieldMap["columns"]>)
+      .filter(key => { const name = fieldMap.columns[key]?.name; return Boolean(name && filtered.has(name)); });
+  }
+
+  private getToday(): Date {
+    const offsetFor = this.context ? this.getOffsetReader(this.context) : browserOffset;
+    const now = new Date();
+    return userCalendarDay(now, offsetFor(now));
+  }
+
+  // The completion filter uses only known raw values, with the same rules as the row colours: Completed is a completed
+  // value, Active any other value (not Canceled), and Overdue is Active with Finish on or before yesterday in the user's
+  // time zone, which Dataverse evaluates with the column's own date behavior. A task due today is never overdue.
+  private buildFilterConditions(fieldMap: FieldMap, filters: FilterState, today: Date): ConditionExpression[] {
     const conditions: ConditionExpression[] = [];
-    const stateColumn = fieldMap.columns.status;
+    const completion = fieldMap.completion;
     const createdOnColumn = fieldMap.columns.createdOn;
     const dueDateColumn = fieldMap.columns.finish;
 
-    if (filters.status !== "all" && !stateColumn) {
-      console.warn("TaskGantt could not resolve the mapped Status dataset column. Status condition was skipped.");
-    }
-
-    if (filters.status !== "all" && stateColumn) {
-      if (!completedRawValue) {
-        console.warn(`TaskGantt could not resolve a raw Dataverse value for Completed. The ${filters.status} status filter was skipped.`);
+    if (filters.status !== "all" && !completion) {
+      console.warn(`TaskGantt has no completion semantics for this mapping. The ${filters.status} status filter was skipped.`);
+    } else if (filters.status !== "all" && completion) {
+      const attributeName = completion.column.name;
+      if (completion.kind === "progress") {
+        conditions.push({ attributeName, conditionOperator: filters.status === "completed" ? CONDITION_GREATER_EQUAL : 3, value: String(completion.completeAt) });
+      } else if (filters.status === "completed") {
+        conditions.push(completion.completed.length === 1
+          ? { attributeName, conditionOperator: 0, value: completion.completed[0] }
+          : { attributeName, conditionOperator: CONDITION_IN, value: completion.completed });
+      } else if (completion.open) {
+        conditions.push(completion.open.length === 1
+          ? { attributeName, conditionOperator: 0, value: completion.open[0] }
+          : { attributeName, conditionOperator: CONDITION_IN, value: completion.open });
       } else {
-        if (filters.status === "completed") {
-          conditions.push({
-            attributeName: stateColumn.name,
-            conditionOperator: 0,
-            value: completedRawValue
-          });
+        // Not in (completed, canceled), written as not-equal conditions because the PCF filter API has no NotIn.
+        [...completion.completed, ...completion.canceled].forEach(value => conditions.push({ attributeName, conditionOperator: CONDITION_NOT_EQUAL, value }));
+      }
+      if (filters.status === "overdue") {
+        if (!dueDateColumn) {
+          console.warn("TaskGantt could not resolve the mapped Finish dataset column. Overdue condition was skipped.");
         } else {
-          conditions.push({
-            attributeName: stateColumn.name,
-            conditionOperator: 1,
-            value: completedRawValue
-          });
-          if (filters.status === "overdue") {
-            if (!dueDateColumn) {
-              console.warn("TaskGantt could not resolve the mapped Due Date dataset column. Overdue condition was skipped.");
-            } else {
-              conditions.push({
-                attributeName: dueDateColumn.name,
-                conditionOperator: 3,
-                value: new Date().toISOString()
-              });
-            }
-          }
+          conditions.push({ attributeName: dueDateColumn.name, conditionOperator: CONDITION_ON_OR_BEFORE, value: lastOverdueDay(today) });
         }
       }
     }
@@ -546,9 +833,13 @@ export class TaskGantt implements ComponentFramework.ReactControl<IInputs, IOutp
     });
   }
 
-  private getFilterSignature(filters: FilterState, completedRawValue: string | undefined): string {
-    const completedSignature = filters.status === "all" ? "" : completedRawValue || "";
-    return `status:${filters.status}:${completedSignature}|createdOn:${filters.createdOn}|dueDate:${filters.dueDate}`;
+  // Overdue depends on the user's current day, so it is part of the signature.
+  private getFilterSignature(filters: FilterState, fieldMap: FieldMap, today: Date): string {
+    const completion = fieldMap.completion;
+    const completionSignature = filters.status === "all" || !completion ? ""
+      : completion.kind === "progress" ? `${completion.column.name}>=${completion.completeAt}` : `${completion.column.name}:${completion.completed.join(",")}/${completion.canceled.join(",")}`;
+    const daySignature = filters.status === "overdue" ? `:${lastOverdueDay(today)}` : "";
+    return `status:${filters.status}:${completionSignature}${daySignature}|createdOn:${filters.createdOn}|dueDate:${filters.dueDate}`;
   }
 
   private applySorting(ds: ComponentFramework.PropertyTypes.DataSet, sorting: SortState): void {
@@ -637,6 +928,7 @@ export class TaskGantt implements ComponentFramework.ReactControl<IInputs, IOutp
   }
 
   private requestControlRender(): void {
+    if (this.destroyed) return;
     try {
       if (this.context?.factory?.requestRender) {
         this.context.factory.requestRender();
@@ -658,6 +950,7 @@ export class TaskGantt implements ComponentFramework.ReactControl<IInputs, IOutp
 
   private startLicenseWatchdog(message: string): void {
     this.clearLicenseWatchdog();
+    if (this.destroyed) return;
 
     this.licenseWatchdogTimer = window.setTimeout(() => {
       this.logLicenseDebug("watchdog:fired", {
@@ -714,6 +1007,7 @@ export class TaskGantt implements ComponentFramework.ReactControl<IInputs, IOutp
   public getOutputs(): IOutputs { return {}; }
 
   public destroy(): void {
+    this.destroyed = true;
     this.clearLicenseWatchdog();
     this.activeLicenseAbortController?.abort();
     this.dependencyLoader?.reset();

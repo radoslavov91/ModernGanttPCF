@@ -21,8 +21,20 @@ const T = Object.fromEntries(fixture.tasks.map(t => [t.name.replace("555 - ", ""
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const noop = () => {};
 const count = (text, fragment) => text.split(fragment).length - 1;
+const scoped = (scope, ids) => ids.map(id => ({ id, scope }));
 
-// A Web API stand-in that answers link FetchXML from the fixture, honouring the project and task-id filters.
+// Parses the link FetchXML: the project scope (eq or in) and the predecessor/successor task-id lists.
+function parseLinkFetch(fetchXml) {
+  const values = block => new Set([...block.matchAll(/<value>([^<]+)<\/value>/g)].map(m => m[1]));
+  const eq = /attribute="msdyn_project" operator="eq" value="([^"]+)"/.exec(fetchXml);
+  const inList = /<condition attribute="msdyn_project" operator="in">(.*?)<\/condition>/.exec(fetchXml);
+  const projects = eq ? new Set([eq[1]]) : inList ? values(inList[1]) : undefined;
+  const ends = [...fetchXml.matchAll(/<condition attribute="([^"]+)" operator="in">(.*?)<\/condition>/g)].filter(m => m[1] !== "msdyn_project");
+  return { projects, pred: ends[0][1], succ: ends[1][1], ids: values(ends[0][2]) };
+}
+
+// A Web API stand-in that answers link FetchXML from the fixture, honouring the project and task-id filters. Rows may
+// carry _msdyn_project_value; otherwise they belong to `project`.
 function makeWebApi(rows, { fail = false, project = fixture.project } = {}) {
   const calls = [];
   return {
@@ -31,12 +43,8 @@ function makeWebApi(rows, { fail = false, project = fixture.project } = {}) {
       const fetchXml = decodeURIComponent(options.replace("?fetchXml=", ""));
       calls.push({ table, fetchXml });
       if (fail) throw new Error("Principal user is missing prvReadmsdyn_projecttaskdependency privilege.");
-      const ids = new Set([...fetchXml.matchAll(/<value>([^<]+)<\/value>/g)].map(m => m[1]));
-      const scope = /attribute="msdyn_project" operator="eq" value="([^"]+)"/.exec(fetchXml);
-      if (scope && scope[1] !== project) return { entities: [] };
-      const pred = /condition attribute="([^"]+)" operator="in"/.exec(fetchXml)[1];
-      const succ = [...fetchXml.matchAll(/condition attribute="([^"]+)" operator="in"/g)][1][1];
-      return { entities: rows.filter(r => ids.has(r[`_${pred}_value`]) || ids.has(r[`_${succ}_value`])) };
+      const { projects, pred, succ, ids } = parseLinkFetch(fetchXml);
+      return { entities: rows.filter(r => (!projects || projects.has(r._msdyn_project_value ?? project)) && (ids.has(r[`_${pred}_value`]) || ids.has(r[`_${succ}_value`]))) };
     }
   };
 }
@@ -85,7 +93,7 @@ function makeWebApi(rows, { fail = false, project = fixture.project } = {}) {
     const api = makeWebApi(fixture.links);
     let changes = 0;
     const loader = new DependencyLoader(api, () => { changes += 1; });
-    loader.sync(PROJECT_OPERATIONS_LINKS, fixture.project, [...many, T.store.id]);
+    loader.sync(PROJECT_OPERATIONS_LINKS, scoped(fixture.project, [...many, T.store.id]));
     assert.strictEqual(loader.view().status, "loading");
     await tick();
     assert.strictEqual(api.calls.length, 3, "121 tasks are read in 3 batches");
@@ -93,35 +101,35 @@ function makeWebApi(rows, { fail = false, project = fixture.project } = {}) {
     // Store Design is the successor of Deed Reviews and the predecessor of Material Sourcing.
     assert.deepStrictEqual(loader.view().links.map(l => l.id).sort(), ["73d6dbe6-3ac3-4302-81fb-f2d77a205e17", "c9b062fe-cacd-494f-a434-72e0255f1997"]);
 
-    loader.sync(PROJECT_OPERATIONS_LINKS, fixture.project, [...many, T.store.id]);
+    loader.sync(PROJECT_OPERATIONS_LINKS, scoped(fixture.project, [...many, T.store.id]));
     await tick();
     assert.strictEqual(api.calls.length, 3, "already-read tasks are not read again");
 
     // Load more brings Material Sourcing: its links are read once, the shared link is not duplicated.
-    loader.sync(PROJECT_OPERATIONS_LINKS, fixture.project, [...many, T.store.id, T.material.id, T.deed.id]);
+    loader.sync(PROJECT_OPERATIONS_LINKS, scoped(fixture.project, [...many, T.store.id, T.material.id, T.deed.id]));
     await tick();
     assert.strictEqual(api.calls.length, 4);
     assert.deepStrictEqual(loader.view().links.map(l => l.id).sort(), ["73d6dbe6-3ac3-4302-81fb-f2d77a205e17", "c9b062fe-cacd-494f-a434-72e0255f1997", "5743710e-afb9-4e16-9ef2-2e9856aeb300"].sort());
     assert.strictEqual(loader.view().status, "ready");
 
     // A refresh resets the cache; an answer that arrives after it is ignored.
-    loader.sync(PROJECT_OPERATIONS_LINKS, fixture.project, [T.health.id]);
+    loader.sync(PROJECT_OPERATIONS_LINKS, scoped(fixture.project, [T.health.id]));
     loader.reset();
     await tick();
     assert.deepStrictEqual(loader.view().links, [], "stale answer after reset is ignored");
     // Another project scope starts from scratch.
-    loader.sync(PROJECT_OPERATIONS_LINKS, "11111111-1111-1111-1111-111111111111", [T.store.id]);
+    loader.sync(PROJECT_OPERATIONS_LINKS, scoped("11111111-1111-1111-1111-111111111111", [T.store.id]));
     await tick();
     assert.deepStrictEqual(loader.view().links, [], "links are only read within the current project");
   }
   {
     const api = makeWebApi(fixture.links, { fail: true });
     const loader = new DependencyLoader(api, noop);
-    loader.sync(PROJECT_OPERATIONS_LINKS, fixture.project, [T.store.id]);
+    loader.sync(PROJECT_OPERATIONS_LINKS, scoped(fixture.project, [T.store.id]));
     await tick();
     assert.strictEqual(loader.view().status, "error");
     assert.ok(loader.view().message.includes("prvReadmsdyn_projecttaskdependency"));
-    loader.sync(PROJECT_OPERATIONS_LINKS, fixture.project, [T.material.id]);
+    loader.sync(PROJECT_OPERATIONS_LINKS, scoped(fixture.project, [T.material.id]));
     await tick();
     assert.strictEqual(api.calls.length, 1, "no retry storm after a failed read");
   }
@@ -132,7 +140,7 @@ function makeWebApi(rows, { fail = false, project = fixture.project } = {}) {
     const originalWarn = console.warn;
     console.warn = message => warnings.push(message);
     try {
-      loader.sync(PROJECT_OPERATIONS_LINKS, fixture.project, [T.building.id]);
+      loader.sync(PROJECT_OPERATIONS_LINKS, scoped(fixture.project, [T.building.id]));
       await tick();
     } finally { console.warn = originalWarn; }
     assert.deepStrictEqual(loader.view().skipped, [{ id: "99999999-0000-0000-0000-000000000001", reason: "unknownType", value: "192350003" }]);
@@ -213,7 +221,7 @@ function makeWebApi(rows, { fail = false, project = fixture.project } = {}) {
   assert.ok(html.includes('class="tg-rows"') && html.includes('class="tg-deps"'));
   assert.strictEqual(count(html, 'class="tg-dep"'), 3, "three Planning Activities lines");
   assert.ok(html.includes('aria-label="555 - Store Design → 555 - Material Sourcing, Finish-to-Start"'));
-  assert.ok(html.includes('aria-pressed="true"') && html.includes(">Dependencies</button>"), "toggle is on by default");
+  assert.ok(html.includes('role="switch"') && html.includes('aria-checked="true"') && html.includes("</span>Dependencies</button>"), "toggle is on by default");
   assert.ok(html.includes('marker-end="url(#tg-dep-arrow-dep)"'));
   assert.ok(!html.includes("tg-deps-status"), "no note when every link is drawn");
   assert.strictEqual(count(html, 'class="tg-bar '), 4, "bars are unchanged");
@@ -295,7 +303,7 @@ function makeWebApi(rows, { fail = false, project = fixture.project } = {}) {
     assert.strictEqual(api.calls.length, 0, "Off reads nothing");
   }
   {
-    // Without a project form or a single project column there is no scope, so nothing is read.
+    // Without a project form or a Project column there is no scope, so nothing is read and the reason is named.
     const api = makeWebApi(fixture.links);
     const { ds } = makeDataset({ entityType: "msdyn_projecttask", columns: PROJECT_TASK_COLUMNS, rows: poRows });
     const ctx = contextFor(ds, api); delete ctx.mode.contextInfo;
@@ -303,7 +311,8 @@ function makeWebApi(rows, { fail = false, project = fixture.project } = {}) {
     control.init(ctx, noop);
     const props = control.updateView(ctx).props;
     assert.strictEqual(props.dependencies.status, "error");
-    assert.ok(props.dependencies.message.includes("current project"));
+    assert.strictEqual(props.dependencies.errorKind, "noProject");
+    assert.ok(props.dependencies.message.includes("Add the Project column to this view"));
     assert.strictEqual(api.calls.length, 0);
   }
   {
@@ -342,6 +351,95 @@ function makeWebApi(rows, { fail = false, project = fixture.project } = {}) {
     const control = new TaskGantt();
     control.init(ctx, noop);
     assert.ok(control.updateView(ctx).props.dependencies.message.includes("Predecessor column, Successor column"));
+  }
+
+  // --- Multi-project views (3.6.0): each row's Project lookup scopes its links ---
+  {
+    // 3.5.0 diagnosis: a view spanning two projects had no single scope, so nothing was read and the misleading
+    // "Dependencies need the current project" error was shown even though the Project column was in the view.
+    const P = fixture.project, Q = "22222222-2222-2222-2222-222222222222", R = "33333333-3333-3333-3333-333333333333";
+    const projectColumn = { name: "msdyn_project", dataType: "Lookup.Simple", displayName: "Project" };
+    const ref = id => ({ id: { guid: `{${id.toUpperCase()}}` }, etn: "msdyn_project", name: id.slice(0, 4) });
+    const qTasks = ["q1", "q2", "q3"].map((n, i) => ({ id: `0000000${i + 1}-0000-0000-0000-00000000000${i + 1}`, values: { msdyn_subject: `Q ${n}`, msdyn_start: new Date("2026-12-01T08:00:00Z"), msdyn_finish: new Date("2026-12-04T17:00:00Z"), msdyn_project: ref(Q) } }));
+    const rTask = { id: "00000009-0000-0000-0000-000000000009", values: { msdyn_subject: "R task", msdyn_start: new Date("2026-12-07T08:00:00Z"), msdyn_finish: new Date("2026-12-08T17:00:00Z"), msdyn_project: ref(R) } };
+    const qLink = { msdyn_projecttaskdependencyid: "aaaaaaaa-0000-0000-0000-000000000001", _msdyn_predecessortask_value: qTasks[0].id, _msdyn_successortask_value: qTasks[1].id, _msdyn_project_value: Q, msdyn_linktype: 192350000, msdyn_projecttaskdependencylinktype: 1 };
+    // Q task 2 -> Q task 3, where task 3 is on the next page.
+    const rLink = { ...qLink, msdyn_projecttaskdependencyid: "aaaaaaaa-0000-0000-0000-000000000002", _msdyn_predecessortask_value: qTasks[1].id, _msdyn_successortask_value: qTasks[2].id };
+    // A row filed under a project the view does not show must never be returned by a scoped query.
+    const strayLink = { ...qLink, msdyn_projecttaskdependencyid: "aaaaaaaa-0000-0000-0000-000000000003", _msdyn_project_value: "44444444-4444-4444-4444-444444444444" };
+    const pRows = poRows.map(row => ({ ...row, values: { ...row.values, msdyn_project: ref(P) } }));
+    const columns = [...PROJECT_TASK_COLUMNS, projectColumn];
+    const api = makeWebApi([...fixture.links, qLink, rLink, strayLink]);
+    const { ds } = makeDataset({ entityType: "msdyn_projecttask", columns, rows: [...pRows, ...qTasks, rTask], hasNextPage: true });
+    ds.sortedRecordIds = [...pRows, qTasks[0], qTasks[1]].map(r => r.id);
+    const ctx = makeContext(ds); ctx.webAPI = api;                          // a Project Tasks view, not a project form
+    const control = new TaskGantt();
+    control.init(ctx, noop);
+    let props = control.updateView(ctx).props;
+    assert.strictEqual(props.dependencies.status, "loading", "multi-project views now read links");
+    await tick();
+    props = control.updateView(ctx).props;
+    assert.strictEqual(api.calls.length, 1, "one batch for the first 50 rows");
+    assert.ok(api.calls[0].fetchXml.includes(`<condition attribute="msdyn_project" operator="in"><value>${P}</value><value>${Q}</value></condition>`), "scoped to exactly the represented projects");
+    assert.ok(api.calls[0].fetchXml.includes('<condition attribute="statecode" operator="eq" value="0" />'));
+    assert.deepStrictEqual(props.dependencies.links.map(l => l.id).sort(), [...fixture.links.map(l => l.msdyn_projecttaskdependencyid), qLink.msdyn_projecttaskdependencyid, rLink.msdyn_projecttaskdependencyid].sort(),
+      "P and Q links are read, including Q task 2 -> Q task 3 whose successor is not loaded yet; the stray row is not");
+    assert.strictEqual(props.dependencies.unscoped, undefined);
+
+    // Q task 3 is not loaded: a stub, then Load more reads only the new tasks and the shared link is not duplicated.
+    let html = render({ tasks: props.tasks, hierarchy: props.hierarchy, dependencies: props.dependencies });
+    assert.strictEqual(count(html, 'class="tg-dep-stub"'), 1);
+    ds.sortedRecordIds = [...pRows, ...qTasks, rTask].map(r => r.id);
+    props = control.updateView(ctx).props;
+    await tick();
+    props = control.updateView(ctx).props;
+    assert.strictEqual(api.calls.length, 2, "only the new page is read");
+    assert.ok(api.calls[1].fetchXml.includes(`<condition attribute="msdyn_project" operator="in"><value>${Q}</value><value>${R}</value></condition>`), "the new page's projects only");
+    assert.ok(!api.calls[1].fetchXml.includes(`<value>${pRows[0].id}</value>`), "already-read tasks are not read again");
+    assert.strictEqual(props.dependencies.links.length, 6, "deduplicated across pages and projects");
+    html = render({ tasks: props.tasks, hierarchy: props.hierarchy, dependencies: props.dependencies });
+    assert.strictEqual(count(html, 'class="tg-dep-stub"'), 0, "the stub reconnects after Load more");
+    assert.strictEqual(count(html, 'class="tg-dep"'), 6);
+  }
+  {
+    // Rows without a Project value are not read and are counted; a view where no row has one explains why.
+    const projectColumn = { name: "msdyn_project", dataType: "Lookup.Simple", displayName: "Project" };
+    const rows = poRows.map((row, i) => ({ ...row, values: { ...row.values, msdyn_project: i === 0 ? null : { id: { guid: fixture.project }, etn: "msdyn_project" } } }));
+    const api = makeWebApi(fixture.links);
+    const { ds } = makeDataset({ entityType: "msdyn_projecttask", columns: [...PROJECT_TASK_COLUMNS, projectColumn], rows });
+    const ctx = makeContext(ds); ctx.webAPI = api;
+    const control = new TaskGantt();
+    control.init(ctx, noop);
+    control.updateView(ctx);
+    await tick();
+    const props = control.updateView(ctx).props;
+    assert.strictEqual(props.dependencies.unscoped, 1);
+    assert.ok(!api.calls[0].fetchXml.includes(`<value>${poRows[0].id}</value>`), "the task without a project is not queried");
+    const html = render({ tasks: props.tasks, hierarchy: props.hierarchy, dependencies: props.dependencies });
+    assert.ok(html.includes("1 task without a project"));
+
+    const { ds: empty } = makeDataset({ entityType: "msdyn_projecttask", columns: [...PROJECT_TASK_COLUMNS, projectColumn], rows: poRows });
+    const emptyCtx = makeContext(empty); emptyCtx.webAPI = api;
+    const emptyControl = new TaskGantt();
+    emptyControl.init(emptyCtx, noop);
+    const view = emptyControl.updateView(emptyCtx).props.dependencies;
+    assert.deepStrictEqual([view.status, view.errorKind], ["error", "noProject"]);
+    assert.ok(view.message.startsWith("None of the loaded tasks has a Project value"));
+    assert.ok(render({ tasks: planningTasks, hierarchy: planningTree, dependencies: view }).includes(">Dependencies unavailable: no project</span>"));
+  }
+  {
+    // Missing read privilege is named, with the Dataverse text kept for support.
+    const { describeReadError } = loadSource("src/dependencyLoader.ts");
+    const loader = new DependencyLoader(makeWebApi([], { fail: true }), noop);
+    loader.sync(PROJECT_OPERATIONS_LINKS, scoped(fixture.project, [T.store.id]));
+    await tick();
+    const view = loader.view();
+    assert.strictEqual(view.errorKind, "access");
+    assert.ok(view.message.startsWith("You do not have permission to read dependency links (msdyn_projecttaskdependency)."));
+    assert.ok(view.message.includes("prvReadmsdyn_projecttaskdependency"));
+    assert.ok(render({ tasks: planningTasks, hierarchy: planningTree, dependencies: view }).includes(">Dependencies unavailable: no access</span>"));
+    assert.strictEqual(describeReadError({ errorCode: 2147746336, message: "Forbidden" }, "x").kind, "access", "privilege error code");
+    assert.deepStrictEqual(describeReadError(new Error("Timeout"), "x"), { kind: "read", message: "Timeout" });
   }
 
   console.log("TaskGantt dependency tests passed.");

@@ -64,11 +64,15 @@ export function customLinkSource(settings:CustomLinkSettings):{ source?:LinkSour
 const lookupKey = (column:string) => `_${column}_value`;
 const FORMATTED = "@OData.Community.Display.V1.FormattedValue";
 
-export function buildLinkFetchXml(source:LinkSource, taskIds:string[], scopeId?:string):string {
+// scopeIds are the projects of the tasks in this batch: one project keeps the 3.5.0 "eq" condition, several use "in".
+export function buildLinkFetchXml(source:LinkSource, taskIds:string[], scopeIds?:string|string[]):string {
   const attributes = [source.idColumn, source.predecessorColumn, source.successorColumn, source.linkTypeColumn, source.mirrorLinkTypeColumn]
     .filter(Boolean).map(name => `<attribute name="${name}" />`).join("");
   const values = taskIds.map(id => `<value>${normalizeId(id)}</value>`).join("");
-  const scope = source.scopeColumn && scopeId ? `<condition attribute="${source.scopeColumn}" operator="eq" value="${normalizeId(scopeId)}" />` : "";
+  const scopes = Array.from(new Set((Array.isArray(scopeIds) ? scopeIds : scopeIds ? [scopeIds] : []).map(normalizeId)));
+  const scope = !source.scopeColumn || !scopes.length ? ""
+    : scopes.length === 1 ? `<condition attribute="${source.scopeColumn}" operator="eq" value="${scopes[0]}" />`
+    : `<condition attribute="${source.scopeColumn}" operator="in">${scopes.map(id => `<value>${id}</value>`).join("")}</condition>`;
   return `<fetch><entity name="${source.table}">${attributes}<filter type="and"><condition attribute="statecode" operator="eq" value="0" />${scope}` +
     `<filter type="or"><condition attribute="${source.predecessorColumn}" operator="in">${values}</condition>` +
     `<condition attribute="${source.successorColumn}" operator="in">${values}</condition></filter></filter></entity></fetch>`;

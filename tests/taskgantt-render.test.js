@@ -81,7 +81,9 @@ for (const allocatedWidth of [1200, 720]) {
   assert.ok(!html.includes("tg-col-assigned"), `${mode}: no owner column`);
   assert.ok(!html.includes("tg-col-status"), `${mode}: no status column`);
   assert.ok(!html.includes("tg-col-description"), `${mode}: no description column`);
-  assert.ok(!html.includes("tg-legend"), `${mode}: no status filter`);
+  assert.ok(!html.includes("tg-status-filter"), `${mode}: no status filter`);
+  assert.ok(!html.includes("tg-legend\""), `${mode}: no colour legend without completion semantics`);
+  assert.ok(html.includes("Deadline colours off: completion not configured"), `${mode}: says why there are no deadline colours`);
   assert.ok(!html.includes("Created On"), `${mode}: no Created On filter`);
   assert.ok(!html.includes("Unassigned"), `${mode}: no placeholder owner text`);
   assert.ok(html.includes("Planned Finish"));
@@ -121,7 +123,7 @@ const taskHtml = renderGantt({
   layout: TASK_LAYOUT,
   onLoadMore: noop
 });
-["<strong>Tasks Plan</strong>", "Task name", "Assigned to", ">Status<", "Start Date", "Due Date", "Created On", "tg-legend", 'aria-label="Tasks Gantt"', "Load the next 10 tasks", "Refresh tasks"]
+["<strong>Tasks Plan</strong>", "Task name", "Assigned to", ">Status<", "Start Date", "Due Date", "Created On", "tg-status-filter", "tg-legend", "Today</button>", 'aria-label="Tasks Gantt"', "Load the next 10 tasks", "Refresh tasks"]
   .forEach(fragment => assert.ok(taskHtml.includes(fragment), `Tasks layout keeps ${fragment}`));
 assert.ok(!taskHtml.includes("tg-col-description"));
 assert.ok(taskHtml.includes('aria-label="Survey site, owner A. Reed"'));
@@ -130,5 +132,27 @@ assert.ok(!taskHtml.includes(">Invalid dates<"));
 
 // Gantt without a layout prop still renders the Tasks layout.
 assert.ok(renderGantt({ tasks: [] }).includes("No tasks found."));
+
+// --- 3.6.0: completion styling only from known raw values ---
+{
+  const past = [new Date(2020, 0, 6), new Date(2020, 0, 8)];
+  const statusLayout = buildLayout(resolveFieldMap([...CUSTOM_COLUMNS, { name: "cr123_state", alias: "statecode", dataType: "OptionSet", displayName: "State" }], "cr123_plan"));
+  const html = renderGantt({ layout: statusLayout, tasks: [
+    item("n", "Neutral late", ...past, { status: "Neutral", statusLabel: "Completed" }),
+    item("e", "Neutral empty", ...past, { status: "Neutral", statusLabel: "" }),
+    item("x", "Canceled late", ...past, { status: "Canceled", statusLabel: "Canceled" }),
+    item("a", "Active late", ...past, { status: "Active", statusLabel: "Active" }),
+    item("c", "Completed", ...past, { status: "Completed", statusLabel: "Completed" })
+  ] });
+  const bar = name => new RegExp(`class="tg-bar ([a-z-]+)"[^>]*title="(?:[^"]*)"[^>]*aria-label="${name}[:"]`).exec(html)?.[1];
+  assert.strictEqual(bar("Neutral late"), "neutral", "a Completed label on a custom mapping gives a neutral bar");
+  assert.strictEqual(bar("Canceled late"), "canceled");
+  assert.strictEqual(bar("Active late"), "overdue", "only Active rows can be overdue");
+  assert.strictEqual(bar("Completed"), "completed");
+  assert.strictEqual(count(html, 'class="tg-urgency overdue"'), 1, "one overdue indicator, for the Active row");
+  assert.strictEqual(count(html, ">✓</span>"), 1, "check mark only for the known Completed row");
+  assert.ok(html.includes('<span class="tg-status neutral">Completed</span>'), "the mapped status text is displayed as returned");
+  assert.ok(html.includes('<span class="tg-status neutral"></span>'), "no invented status text");
+}
 
 console.log("TaskGantt render tests passed.");

@@ -238,7 +238,9 @@ assert.ok(renderGantt({ tasks: [], layout: buildLayout(poPartial) }).includes('c
   const props = control.updateView(makeContext(ds)).props;
   assert.strictEqual(props.layout.title, "Project Tasks");
   assert.strictEqual(props.tasks[0].isSummary, true);
-  assert.strictEqual(props.tasks[0].start.getTime(), Date.parse("2026-05-04T08:00:00Z"), "msdyn_start is the Start default");
+  // Date and Time values are shown on their calendar day in the user zone (the browser zone when the host gives none).
+  const startInstant = new Date("2026-05-04T08:00:00Z");
+  assert.strictEqual(props.tasks[0].start.getTime(), new Date(startInstant.getFullYear(), startInstant.getMonth(), startInstant.getDate()).getTime(), "msdyn_start is the Start default");
   assert.deepStrictEqual(props.hierarchy.roots.map(n => n.task.recordId), ["s1", "t9"]);
   assert.strictEqual(props.hierarchy.roots[1].parentMissing, true);
   assert.strictEqual(props.hierarchy.roots[1].task.parent.name, "Planning");
